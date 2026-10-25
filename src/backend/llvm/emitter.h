@@ -269,6 +269,7 @@ private:
   bool psq_direct_proven_ = false;
   bool psq_indexed_proven_ = false;
   llvm::Value *pending_fprf_ = nullptr;
+  bool fprf_needed_ = true;  // spike: DOLRECOMP_FPRF_KEEP lists the only functions whose FPRF is observed
   std::array<bool, DOLIR_STATE_COUNT> used_{};
   std::array<bool, DOLIR_STATE_COUNT> dirty_{};
   std::vector<llvm::BasicBlock *> blocks_;

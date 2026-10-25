@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "backend/llvm/native_abi.h"
 
 #include "backend/llvm/emitter.h"
@@ -178,6 +179,11 @@ FunctionEmitter::bodyFunctionType(const DolLLVMFunctionRange *range) {
 }
 
 llvm::CallingConv::ID FunctionEmitter::bodyCallingConvention() const {
+  // Spike: DOLRECOMP_PRESERVE_NONE=1 uses preserve_none, so small hot guest functions do not save and
+  // restore the Win64 callee-saved registers (rbx, rbp, rdi, rsi, r12-r15, xmm6-15) on every call.
+  static const bool preserve_none = std::getenv("DOLRECOMP_PRESERVE_NONE") != nullptr;
+  if (preserve_none)
+    return llvm::CallingConv::PreserveNone;
   return llvm::CallingConv::Fast;
 }
 

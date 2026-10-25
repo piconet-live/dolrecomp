@@ -8,9 +8,21 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/Alignment.h>
 
+#include <cstdlib>
+
 namespace dolllvm {
 
 using namespace llvm;
+
+// Spike: DOLRECOMP_MEM2_BASE moves the second direct-memory window. For GameCube builds 0xA0000000
+// (the locked L1 cache at 0xE0000000 after normalization) lets the runtime map GX's scratchpad there.
+static u32 mem2Base() {
+  static const u32 base = [] {
+    const char *v = std::getenv("DOLRECOMP_MEM2_BASE");
+    return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : static_cast<u32>(WII_MEM2_BASE);
+  }();
+  return base;
+}
 
 Value *FunctionEmitter::normalizeAddress(Value *address) {
   return builder_.CreateAnd(address, builder_.getInt32(~0x40000000u));
@@ -92,13 +104,13 @@ Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
   builder_.SetInsertPoint(checkMem2);
   Value *inMem2 = builder_.CreateAnd(
       builder_.CreateIsNotNull(mem2_),
-      rangeCheck(normalized, WII_MEM2_BASE, mem2_size_, width));
+      rangeCheck(normalized, mem2Base(), mem2_size_, width));
   builder_.CreateCondBr(inMem2, mem2Block, slowBlock,
                         MDBuilder(context_).createBranchWeights(2000, 1));
 
   builder_.SetInsertPoint(mem2Block);
   Value *mem2Offset =
-      builder_.CreateSub(normalized, builder_.getInt32(WII_MEM2_BASE));
+      builder_.CreateSub(normalized, builder_.getInt32(mem2Base()));
   Value *mem2Ptr =
       builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), mem2_, mem2Offset);
   Value *mem2Value = endianLoad(mem2Ptr, resultType, width);
@@ -204,13 +216,13 @@ void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
   builder_.SetInsertPoint(checkMem2);
   Value *inMem2 = builder_.CreateAnd(
       builder_.CreateIsNotNull(mem2_),
-      rangeCheck(normalized, WII_MEM2_BASE, mem2_size_, width));
+      rangeCheck(normalized, mem2Base(), mem2_size_, width));
   builder_.CreateCondBr(inMem2, mem2Block, slowBlock,
                         MDBuilder(context_).createBranchWeights(2000, 1));
 
   builder_.SetInsertPoint(mem2Block);
   Value *mem2Offset =
-      builder_.CreateSub(normalized, builder_.getInt32(WII_MEM2_BASE));
+      builder_.CreateSub(normalized, builder_.getInt32(mem2Base()));
   Value *mem2Ptr =
       builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), mem2_, mem2Offset);
   endianStore(mem2Ptr, value, width);

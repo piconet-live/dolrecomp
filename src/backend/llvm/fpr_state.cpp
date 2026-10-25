@@ -195,7 +195,10 @@ Value *FunctionEmitter::preferPairedNaN(Value *result, Value *left,
   return selected;
 }
 
-void FunctionEmitter::updateFPRF(Value *lane0) { pending_fprf_ = lane0; }
+void FunctionEmitter::updateFPRF(Value *lane0) {
+  if (fprf_needed_)
+    pending_fprf_ = lane0;
+}
 
 void FunctionEmitter::materializeFPRF() {
   if (!pending_fprf_)

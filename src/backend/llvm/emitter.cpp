@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "backend/llvm/emitter.h"
 #include "cpu/cpu.h"
 
@@ -35,6 +36,21 @@ FunctionEmitter::FunctionEmitter(LLVMContext &context, Module &module,
       modern_runtime_(options.runtime == DOLLLVM_RUNTIME_MODERNGEKKO),
       expected_ram_size_(options.ram_size),
       expected_mem2_size_(options.mem2_size) {
+  if (const char *keep = std::getenv("DOLRECOMP_FPRF_KEEP")) {
+    // Spike: FPRF is computed only in the listed functions (those with an mcrfs or mffs).
+    fprf_needed_ = false;
+    for (const char *p = keep; *p;) {
+      char *end = nullptr;
+      const unsigned long v = std::strtoul(p, &end, 16);
+      if (end == p)
+        break;
+      if (static_cast<u32>(v) == source_.guest_start)
+        fprf_needed_ = true;
+      p = end;
+      while (*p == ',' || *p == ' ')
+        ++p;
+    }
+  }
   const Triple triple(module_.getTargetTriple());
   intrinsic_escapes_ = triple.isX86() && !modern_runtime_;
   cold_escapes_ = modern_runtime_ || intrinsic_escapes_ ||

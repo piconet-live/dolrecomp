@@ -289,6 +289,14 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     if (!codegen_level || !codegen_level[0])
         codegen_level = "2";
     hash = hash_bytes(hash, codegen_level, strlen(codegen_level));
+    /* Spike: codegen environment switches must key the cache too. */
+    const char* spike_envs[] = {"DOLRECOMP_MEM2_BASE", "DOLRECOMP_FPRF_KEEP", "DOLRECOMP_PRESERVE_NONE"};
+    for (size_t e = 0; e < sizeof(spike_envs) / sizeof(spike_envs[0]); e++) {
+        const char* v = getenv(spike_envs[e]);
+        hash = hash_bytes(hash, spike_envs[e], strlen(spike_envs[e]));
+        if (v)
+            hash = hash_bytes(hash, v, strlen(v));
+    }
     const char* write_journal = getenv("DOLRECOMP_LLVM_WRITE_JOURNAL");
     if (!write_journal)
         write_journal = "0";
