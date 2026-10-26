@@ -115,7 +115,7 @@ Value *FunctionEmitter::nativeOutputs(bool fromContext) {
   }
   if (nativeCyclesInResult(abi_range_))
     lanes[stateLanes] =
-        builder_.CreateLoad(Type::getInt64Ty(context_), cycles_);
+        loadCycles();
   if (laneCount == 1)
     return lanes.front();
   Value *result = UndefValue::get(resultType);
@@ -183,10 +183,10 @@ void FunctionEmitter::acceptNativeResult(Value *result,
     builder_.CreateStore(value, state_[slot]);
   }
   if (nativeCyclesInResult(range))
-    builder_.CreateStore(nativeCycleValue(result, range), cycles_);
+    storeCycles(nativeCycleValue(result, range));
   invalidateFPRepresentations();
   fp_available_checked_ = false;
-  pending_fprf_ = nullptr;
+  clearPendingFPRF();
   known_state_.fill(nullptr);
   psq_direct_proven_ = false;
   psq_indexed_proven_ = false;

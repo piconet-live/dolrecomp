@@ -50,8 +50,9 @@ bool FunctionEmitter::emitVectorPairedFMA(DolIRExactPaired op, u32 d, u32 a,
                  : architecturalAddend;
     Value *result = constrainedPairFMA(left, multiplier, addend);
     result = correctPairedFMARounding(result, left, multiplier, addend);
-    result = preferPairedFMANaN(result, left, architecturalAddend,
-                                architecturalMultiplier, operandsFinite);
+    if (!jit64_paired_fp_)
+      result = preferPairedFMANaN(result, left, architecturalAddend,
+                                  architecturalMultiplier, operandsFinite);
     Value *rounded = roundPairToSingle(result);
     if (!negative)
       return rounded;
@@ -61,14 +62,42 @@ bool FunctionEmitter::emitVectorPairedFMA(DolIRExactPaired op, u32 d, u32 a,
     Value *negated = builder_.CreateBitCast(
         builder_.CreateXor(builder_.CreateBitCast(rounded, integerPair), sign),
         rounded->getType(), "ps.fma.negative");
-    return operandsFinite
+    return operandsFinite || jit64_paired_fp_
                ? negated
                : builder_.CreateSelect(builder_.CreateFCmpORD(rounded, rounded),
                                        negated, rounded);
   };
 
   Value *rounded;
-  if (hasSingle && !singleSafe) {
+  if ((guard_paired_fma_ || track_singles_) && singleSafe) {
+    // DOLRECOMP_PS_MADD=guarded, and DOLRECOMP_SINGLE_FP=track: the packed
+    // single result only where both lanes are normal numbers; anything else
+    // takes the double sequence on the operands' doubles (the widening of a
+    // safe single view is exact).
+    Value *fast = emitPath(true);
+    Value *unusual = singleFMAUnusual(fast);
+    BasicBlock *fastEnd = builder_.GetInsertBlock();
+    BasicBlock *rare =
+        BasicBlock::Create(context_, "fma_single_unusual", function_);
+    BasicBlock *join =
+        BasicBlock::Create(context_, "fma_single_join", function_);
+    builder_.CreateCondBr(unusual, rare, join,
+                          MDBuilder(context_).createBranchWeights(1, 256));
+    builder_.SetInsertPoint(rare);
+    Value *slow = emitPath(false);
+    BasicBlock *rareEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(join);
+    builder_.SetInsertPoint(join);
+    PHINode *selected =
+        builder_.CreatePHI(fast->getType(), 2, "ps.fma.single.exact");
+    selected->addIncoming(fast, fastEnd);
+    selected->addIncoming(slow, rareEnd);
+    rounded = selected;
+  } else if (track_singles_) {
+    // DOLRECOMP_SINGLE_FP=track: operands whose views are not usable take
+    // the double sequence.
+    rounded = emitPath(false);
+  } else if (hasSingle && !singleSafe) {
     Value *nonIEEE = niEnabled();
     BasicBlock *fast = BasicBlock::Create(context_, "fma_single", function_);
     BasicBlock *strict =
@@ -101,8 +130,29 @@ bool FunctionEmitter::emitVectorPairedFMA(DolIRExactPaired op, u32 d, u32 a,
   return true;
 }
 
+Value *FunctionEmitter::singleFMAUnusual(Value *result) {
+  // Exponent field 0 or 255: ((bits & 0x7F800000) + 0x00800000) & 0x7F000000
+  // is zero exactly then.
+  Type *scalar = Type::getInt32Ty(context_);
+  Type *bitsType = scalar;
+  if (auto *vector = dyn_cast<FixedVectorType>(result->getType()))
+    bitsType = FixedVectorType::get(scalar, vector->getNumElements());
+  auto constant = [&](u32 value) { return ConstantInt::get(bitsType, value); };
+  Value *bits = builder_.CreateBitCast(result, bitsType);
+  Value *next = builder_.CreateAdd(
+      builder_.CreateAnd(bits, constant(0x7F800000u)), constant(0x00800000u));
+  Value *unusual = builder_.CreateICmpEQ(
+      builder_.CreateAnd(next, constant(0x7F000000u)), constant(0));
+  if (!bitsType->isVectorTy())
+    return unusual;
+  return builder_.CreateOr(builder_.CreateExtractElement(unusual, uint64_t{0}),
+                           builder_.CreateExtractElement(unusual, 1u),
+                           "fma.unusual");
+}
+
 Value *FunctionEmitter::constrainedPairFMA(Value *left, Value *multiplier,
                                            Value *addend) {
+  uses_fma_ = true;
   auto *vector = dyn_cast<FixedVectorType>(left->getType());
   if (vector && vector->getNumElements() == 2 &&
       vector->getElementType()->isFloatTy()) {
@@ -144,11 +194,14 @@ Value *FunctionEmitter::correctPairedFMARounding(Value *result, Value *left,
   Value *hasTie =
       builder_.CreateOr(builder_.CreateExtractElement(ties, uint64_t{0}),
                         builder_.CreateExtractElement(ties, 1u));
-  Value *fpscr = builder_.CreateLoad(Type::getInt32Ty(context_),
-                                     state_[DOLIR_STATE_FPSCR]);
-  Value *roundsToNearest = builder_.CreateICmpEQ(
-      builder_.CreateAnd(fpscr, builder_.getInt32(3)), builder_.getInt32(0));
-  Value *needsFixup = builder_.CreateAnd(roundsToNearest, hasTie);
+  Value *needsFixup = hasTie;
+  if (!jit64_paired_fp_) {
+    Value *fpscr = builder_.CreateLoad(Type::getInt32Ty(context_),
+                                       state_[DOLIR_STATE_FPSCR]);
+    Value *roundsToNearest = builder_.CreateICmpEQ(
+        builder_.CreateAnd(fpscr, builder_.getInt32(3)), builder_.getInt32(0));
+    needsFixup = builder_.CreateAnd(roundsToNearest, hasTie);
+  }
   BasicBlock *regular =
       BasicBlock::Create(context_, "fma_round_regular", function_);
   BasicBlock *rare = BasicBlock::Create(context_, "fma_round_fixup", function_);
@@ -160,7 +213,8 @@ Value *FunctionEmitter::correctPairedFMARounding(Value *result, Value *left,
   builder_.CreateBr(join);
 
   builder_.SetInsertPoint(rare);
-  Function *fixup = getPairFMARoundingFixup(module_);
+  uses_fma_ = true;
+  Function *fixup = getPairFMARoundingFixup(module_, jit64_paired_fp_);
   CallInst *fixed = builder_.CreateCall(
       fixup, {result, left, multiplier, addend}, "ps.fma.corrected");
   fixed->setCallingConv(fixup->getCallingConv());

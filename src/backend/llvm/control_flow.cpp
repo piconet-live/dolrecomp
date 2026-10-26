@@ -43,7 +43,9 @@ void FunctionEmitter::emitColdEntry(BasicBlock *entryMiss) {
 void FunctionEmitter::emitFallbackHandler() {
   resetFPRepresentations();
   known_state_.fill(nullptr);
-  pending_fprf_ = nullptr;
+  clearPendingFPRF();
+  unsynced_.reset();
+  deferred_cycles_ = 0;
   fp_available_checked_ = false;
   builder_.SetInsertPoint(fallback_block_);
   if (modern_runtime_) {
@@ -99,7 +101,17 @@ void FunctionEmitter::emitFallbackHandler() {
                         false));
   if (auto *function = dyn_cast<Function>(callee.getCallee()))
     function->addFnAttr(Attribute::Cold);
-  builder_.CreateCall(callee, {ctx_, raw, fallback_pc_});
+  tagRuntimeCall(builder_.CreateCall(callee, {ctx_, raw, fallback_pc_}),
+                 RegisterWrites::Any);
+  if (sync_changed_) {
+    // Back to the run loop, which re-enters at the next instruction. Resuming
+    // here instead would give every block of the function a predecessor
+    // where all registers were just reloaded, and with it a merge of every
+    // register at every block, for an instruction that is rare by
+    // construction.
+    returnFromBody();
+    return;
+  }
   Value *exception =
       loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exception));
   BasicBlock *resume =
@@ -160,6 +172,13 @@ bool FunctionEmitter::emitTerminator(const DolIRTerminator &term,
       yes = exitDestination(term.target_addresses[0]);
     if (!no)
       no = exitDestination(term.target_addresses[1]);
+    // An edge that first writes what its target does not take over
+    // (carryUnsynced).
+    if (lazy_edge_[0])
+      yes = lazy_edge_[0];
+    if (lazy_edge_[1])
+      no = lazy_edge_[1];
+    lazy_edge_.fill(nullptr);
     builder_.CreateCondBr(values_[term.condition], yes, no);
     return true;
   }
@@ -183,27 +202,47 @@ bool FunctionEmitter::emitTerminator(const DolIRTerminator &term,
             blocks_[block]);
       builder_.SetInsertPoint(unknown);
     }
+    if (native_indirect_calls_ && term.linked && !native_abi_) {
+      emitIndirectGuards(term, target);
+      emitNativeIndirectCall(term, target);
+    }
     if (native_abi_) {
       if (!cold_escapes_)
         settleCycles();
       returnNative(target);
     } else {
-      for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
-        if (dirty_[slot]) {
-          auto stateSlot = static_cast<DolIRStateSlot>(slot);
-          storeContext(stateSlot,
-                       builder_.CreateLoad(type(dolir_state_type(stateSlot)),
-                                           state_[slot]));
+      if (sync_changed_) {
+        syncDirtyState();
+      } else {
+        for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
+          if (dirty_[slot]) {
+            auto stateSlot = static_cast<DolIRStateSlot>(slot);
+            storeContext(stateSlot,
+                         builder_.CreateLoad(type(dolir_state_type(stateSlot)),
+                                             state_[slot]));
+          }
         }
       }
+      if (closed_ && !term.linked) {
+        const u32 block = (term.guest_pc - source_.guest_start) / 4u;
+        const u32 raw = block < source_.block_count
+                            ? source_.blocks[block].raw
+                            : 0u;
+        emitClosedIndirect(target, ((raw >> 1) & 0x3FFu) == 528u);
+        return true;
+      }
       storeContext(DOLIR_STATE_PC, target);
-      Value *downcount =
-          loadOffset(Type::getInt64Ty(context_), offsetof(CPUState, downcount));
-      Value *cycles = builder_.CreateLoad(Type::getInt64Ty(context_), cycles_);
-      builder_.CreateStore(builder_.CreateSub(downcount, cycles),
-                           bytePtr(offsetof(CPUState, downcount)));
-      builder_.CreateStore(builder_.getInt64(0), cycles_);
-      builder_.CreateStore(builder_.getInt64(0), pending_cycles_);
+      if (!register_counters_) {
+        Value *downcount = loadOffset(Type::getInt64Ty(context_),
+                                      offsetof(CPUState, downcount));
+        Value *cycles = loadCycles();
+        builder_.CreateStore(builder_.CreateSub(downcount, cycles),
+                             bytePtr(offsetof(CPUState, downcount)));
+        storeCycles(builder_.getInt64(0));
+        builder_.CreateStore(builder_.getInt64(0), pending_cycles_);
+      }
+      // With the counters in registers the cycles go back to the caller
+      // uncharged; whoever leaves for the run loop charges them.
       returnFromBody();
     }
     return true;
@@ -220,6 +259,11 @@ bool FunctionEmitter::emitTerminator(const DolIRTerminator &term,
       if (!cold_escapes_)
         settleCycles();
       returnNative(builder_.getInt32(term.target_addresses[0]));
+    } else if (register_counters_) {
+      syncDirtyState();
+      storeContext(DOLIR_STATE_PC,
+                   builder_.getInt32(term.target_addresses[0]));
+      returnFromBody();
     } else {
       materialize(term.target_addresses[0]);
       returnFromBody();

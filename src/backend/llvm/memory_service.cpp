@@ -74,12 +74,14 @@ Value *FunctionEmitter::externalRead(Value *address, u32 width) {
   builder_.CreateCondBr(builder_.CreateIsNotNull(function), call, zero,
                         MDBuilder(context_).createBranchWeights(2000, 1));
   builder_.SetInsertPoint(call);
+  countHere(current_pc_, 4, 0);
   materialize(current_pc_);
   auto *functionType = FunctionType::get(
       Type::getInt64Ty(context_),
       {pointer, Type::getInt32Ty(context_), Type::getInt8Ty(context_)}, false);
-  Value *called = builder_.CreateCall(
+  CallInst *called = builder_.CreateCall(
       functionType, function, {ctx_, address, builder_.getInt8(width)});
+  tagRuntimeCall(called, RegisterWrites::None);
   Value *exception =
       loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exception));
   BasicBlock *resume =
@@ -91,7 +93,9 @@ Value *FunctionEmitter::externalRead(Value *address, u32 width) {
   builder_.SetInsertPoint(failed);
   returnFromBody();
   builder_.SetInsertPoint(resume);
-  reloadUsedState();
+  // The runtime's memory service does not change guest registers.
+  if (!sync_changed_)
+    reloadUsedState();
   builder_.CreateBr(join);
   BasicBlock *calledEnd = builder_.GetInsertBlock();
   builder_.SetInsertPoint(zero);
@@ -153,17 +157,20 @@ void FunctionEmitter::externalWrite(Value *address, Value *value, u32 width) {
       BasicBlock::Create(context_, "write_slow_done", function_);
   builder_.CreateCondBr(builder_.CreateIsNotNull(function), call, done);
   builder_.SetInsertPoint(call);
+  countHere(current_pc_, 5, 0);
   materialize(current_pc_);
   auto *functionType = FunctionType::get(
       Type::getVoidTy(context_),
       {pointer, Type::getInt32Ty(context_), Type::getInt64Ty(context_),
        Type::getInt8Ty(context_)},
       false);
-  builder_.CreateCall(
-      functionType, function,
-      {ctx_, address,
-       builder_.CreateZExtOrTrunc(value, Type::getInt64Ty(context_)),
-       builder_.getInt8(width)});
+  tagRuntimeCall(
+      builder_.CreateCall(
+          functionType, function,
+          {ctx_, address,
+           builder_.CreateZExtOrTrunc(value, Type::getInt64Ty(context_)),
+           builder_.getInt8(width)}),
+      RegisterWrites::None);
   Value *exception =
       loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exception));
   BasicBlock *resume =
@@ -175,7 +182,8 @@ void FunctionEmitter::externalWrite(Value *address, Value *value, u32 width) {
   builder_.SetInsertPoint(failed);
   returnFromBody();
   builder_.SetInsertPoint(resume);
-  reloadUsedState();
+  if (!sync_changed_)
+    reloadUsedState();
   builder_.CreateBr(done);
   builder_.SetInsertPoint(done);
 }

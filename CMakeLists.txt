@@ -115,6 +115,8 @@ if(DOLRECOMP_ENABLE_LLVM)
         src/backend/llvm/instruction_service.cpp
         src/backend/llvm/memory.cpp
         src/backend/llvm/memory_service.cpp
+        src/backend/llvm/closed.cpp
+        src/backend/llvm/count.cpp
         src/backend/llvm/memory_fallback.cpp
         src/backend/llvm/register_state.cpp
         src/backend/llvm/state_access.cpp
@@ -126,6 +128,8 @@ if(DOLRECOMP_ENABLE_LLVM)
         src/backend/llvm/instructions.cpp
         src/backend/llvm/runtime.cpp
         src/backend/llvm/floating_point.cpp
+        src/backend/llvm/scalar_fp.cpp
+        src/backend/llvm/single_track.cpp
         src/backend/llvm/fp_fixups.cpp
         src/backend/llvm/fpr_state.cpp
         src/backend/llvm/paired_single.cpp

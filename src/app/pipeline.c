@@ -4,6 +4,7 @@
 #include "analysis/smc.h"
 #include "app/paths.h"
 #include "backend/codegen.h"
+#include "backend/codegen_switches.h"
 #include "backend/dispatch.h"
 #include "backend/emitter.h"
 #include "backend/native_module.h"
@@ -58,6 +59,13 @@ static u32 c_chunk_instructions(void) {
 // SSA regions, ABI v4 variants and ThinLTO summaries.
 #define DOLLLVM_CACHE_VERSION "dolllvm-v29"
 
+#define LLVM_MAX_IMPORTS 32u
+
+typedef struct {
+    u32 start;
+    u32 count;
+} LLVMImport;
+
 typedef struct {
     const PPCInst* insts;
     u32 count;
@@ -86,6 +94,13 @@ typedef struct {
     char path[1400];
     char cache_path[1400];
     char cache_bitcode_path[1400];
+    /* Small callees whose code is also given to this chunk's module, as
+       definitions LLVM may inline but does not emit (their own chunks still
+       define them). */
+    const LoadedCodeSection* sections;
+    u32 section_count;
+    LLVMImport imports[LLVM_MAX_IMPORTS];
+    u32 import_count;
 } LLVMChunkJob;
 
 static u32 parse_llvm_target_set(const char* text,
@@ -251,6 +266,151 @@ static u64 hash_file_contents(u64 hash, const char* path) {
     return hash;
 }
 
+static const u8* guest_code(const LoadedCodeSection* sections,
+                            u32 section_count, u32 start, u32 count) {
+    for (u32 s = 0; s < section_count; s++) {
+        const LoadedCodeSection* section = &sections[s];
+        if (section->data && start >= section->address &&
+            start - section->address + count * 4u <= section->size)
+            return section->data + (start - section->address);
+    }
+    return NULL;
+}
+
+static PPCInst* decode_guest_code(const LoadedCodeSection* sections,
+                                  u32 section_count, u32 start, u32 count) {
+    const LoadedCodeSection* section = NULL;
+    for (u32 s = 0; s < section_count; s++)
+        if (sections[s].data && start >= sections[s].address &&
+            start - sections[s].address + count * 4u <= sections[s].size)
+            section = &sections[s];
+    if (!section)
+        return NULL;
+    PPCInst* insts = (PPCInst*)malloc((size_t)count * sizeof(*insts));
+    if (!insts)
+        return NULL;
+    for (u32 i = 0; i < count; i++) {
+        u32 raw = read_be32(section->data + (start - section->address) + i * 4u);
+        insts[i] = ppc_decode(raw, start + i * 4u);
+        if (insts[i].op == PPC_OP_UNKNOWN &&
+            embedded_data_word(section->embedded_data_mode, raw))
+            insts[i].embedded_data = true;
+    }
+    return insts;
+}
+
+/* DOLRECOMP_INLINE_CALLEES=N: a chunk of at most N guest instructions that
+   this chunk calls or branches to directly (and, to a small depth, what
+   those call) is compiled into this chunk's module too, so LLVM can inline
+   it. 0 or unset: off. */
+static u32 llvm_inline_callee_limit(void) {
+    const char* configured = getenv("DOLRECOMP_INLINE_CALLEES");
+    if (!configured || !configured[0])
+        return 0;
+    char* end = NULL;
+    unsigned long value = strtoul(configured, &end, 10);
+    return end && !*end && value <= 4096u ? (u32)value : 0;
+}
+
+static const DolLLVMFunctionRange* llvm_range_at(
+    const DolLLVMFunctionRange* ranges, u32 range_count, u32 address) {
+    u32 lo = 0;
+    u32 hi = range_count;
+    while (lo < hi) {
+        u32 mid = lo + (hi - lo) / 2u;
+        if (address < ranges[mid].start)
+            hi = mid;
+        else if (address >= ranges[mid].end)
+            lo = mid + 1u;
+        else
+            return &ranges[mid];
+    }
+    return NULL;
+}
+
+static void collect_llvm_imports(LLVMChunkJob* job, const PPCInst* insts,
+                                 u32 count, u32 address, u32 limit) {
+    job->import_count = 0;
+    if (!limit)
+        return;
+    /* Breadth first from this chunk; entries added to the list are scanned
+       in turn, to a depth of three calls (DOLRECOMP_INLINE_DEPTH=<1..24>
+       for another depth: the compiler's register save and restore helpers
+       are chains of up to eighteen one-instruction functions, each falling
+       into the next). */
+    u32 max_depth = 3u;
+    /* Sixteen imports a chunk, as before the switch existed; a deeper import
+       may take all LLVM_MAX_IMPORTS. */
+    u32 max_imports = 16u;
+    const char* configured_depth = getenv("DOLRECOMP_INLINE_DEPTH");
+    if (configured_depth && configured_depth[0]) {
+        char* end = NULL;
+        unsigned long value = strtoul(configured_depth, &end, 10);
+        if (end && !*end && value >= 1u && value <= 24u) {
+            max_depth = (u32)value;
+            max_imports = LLVM_MAX_IMPORTS;
+        }
+    }
+    u32 scanned = 0;
+    for (u32 depth = 0; depth < max_depth; depth++) {
+        u32 first = depth == 0 ? 0 : scanned;
+        u32 last = depth == 0 ? 1 : job->import_count;
+        for (u32 item = first; item < last; item++) {
+            const PPCInst* code = insts;
+            u32 code_count = count;
+            u32 code_address = address;
+            PPCInst* owned = NULL;
+            if (depth != 0) {
+                code_count = job->imports[item].count;
+                code_address = job->imports[item].start;
+                owned = decode_guest_code(job->sections, job->section_count,
+                                          code_address, code_count);
+                code = owned;
+                if (!code)
+                    continue;
+            }
+            DolIRModule module;
+            dolir_module_init(&module);
+            if (dolir_build_chunk(&module, code, code_count, code_address)) {
+                const DolIRFunction* function = &module.functions[0];
+                for (u32 b = 0; b < function->block_count; b++) {
+                    const DolIRTerminator* term =
+                        &function->blocks[b].terminator;
+                    u32 targets = term->kind == DOLIR_TERM_COND_BRANCH ? 2u
+                                  : term->kind == DOLIR_TERM_BRANCH ||
+                                          term->kind == DOLIR_TERM_FALLTHROUGH
+                                      ? 1u
+                                      : 0u;
+                    for (u32 t = 0; t < targets; t++) {
+                        if (term->targets[t] != DOLIR_NO_BLOCK)
+                            continue;
+                        const DolLLVMFunctionRange* target = llvm_range_at(
+                            job->ranges, job->range_count,
+                            term->target_addresses[t]);
+                        if (!target || target->start == address ||
+                            (target->end - target->start) / 4u > limit ||
+                            job->import_count >= max_imports)
+                            continue;
+                        bool known = false;
+                        for (u32 i = 0; i < job->import_count; i++)
+                            known |= job->imports[i].start == target->start;
+                        if (known)
+                            continue;
+                        job->imports[job->import_count].start = target->start;
+                        job->imports[job->import_count].count =
+                            (target->end - target->start) / 4u;
+                        job->import_count++;
+                    }
+                }
+            }
+            dolir_module_free(&module);
+            free(owned);
+        }
+        if (depth != 0)
+            scanned = last;
+    }
+}
+
 static u64 llvm_job_hash(const LLVMChunkJob* job) {
     u64 hash = 1469598103934665603ull;
     hash =
@@ -289,6 +449,14 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     if (!codegen_level || !codegen_level[0])
         codegen_level = "2";
     hash = hash_bytes(hash, codegen_level, strlen(codegen_level));
+    /* Codegen environment switches key the cache too. */
+    for (size_t e = 0; e < DOLRECOMP_CODEGEN_SWITCH_COUNT; e++) {
+        const char* name = dolrecomp_codegen_switches[e];
+        const char* v = getenv(name);
+        hash = hash_bytes(hash, name, strlen(name));
+        if (v)
+            hash = hash_bytes(hash, v, strlen(v));
+    }
     const char* write_journal = getenv("DOLRECOMP_LLVM_WRITE_JOURNAL");
     if (!write_journal)
         write_journal = "0";
@@ -314,6 +482,15 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     }
     for (u32 i = 0; i < job->range_count; i++)
         hash = hash_bytes(hash, &job->ranges[i], sizeof(job->ranges[i]));
+    hash = hash_bytes(hash, &job->import_count, sizeof(job->import_count));
+    for (u32 i = 0; i < job->import_count; i++) {
+        hash = hash_bytes(hash, &job->imports[i], sizeof(job->imports[i]));
+        const u8* code = guest_code(job->sections, job->section_count,
+                                    job->imports[i].start,
+                                    job->imports[i].count);
+        if (code)
+            hash = hash_bytes(hash, code, (size_t)job->imports[i].count * 4u);
+    }
     for (u32 i = 0; i < job->entry_point_count; i++) {
         u32 address = job->entry_points[i];
         if (address >= job->function_address &&
@@ -345,7 +522,15 @@ static u32* collect_llvm_partition_points(const LoadedCodeSection* sections,
                                           u32 section_count, u32 program_entry,
                                           const DolRecompSymbolMap* symbols,
                                           u32* result_count) {
-    size_t capacity = 1u + (symbols ? symbols->count : 0u);
+    /* DOLRECOMP_PARTITION_AT=<hex address>[,...]: further places where a
+       function starts. For code that is entered by a plain branch from other
+       functions in the middle of what would otherwise be one function (several
+       small routines sharing one tail): an entry anywhere but at a function's
+       first instruction goes through the entry switch of the ordinary body,
+       with every register reloaded, and never reaches a closed body. */
+    const char* extra_points = getenv("DOLRECOMP_PARTITION_AT");
+    size_t capacity = 1u + (symbols ? symbols->count : 0u) +
+                      (extra_points ? strlen(extra_points) / 2u + 1u : 0u);
     for (u32 i = 0; i < section_count; i++)
         capacity += sections[i].size / 4u;
     u32* points = (u32*)malloc(capacity * sizeof(*points));
@@ -354,6 +539,15 @@ static u32* collect_llvm_partition_points(const LoadedCodeSection* sections,
     u32 count = 0;
     if (llvm_code_address(sections, section_count, program_entry))
         points[count++] = program_entry;
+    while (extra_points && *extra_points) {
+        char* end = NULL;
+        unsigned long address = strtoul(extra_points, &end, 16);
+        if (end == extra_points)
+            break;
+        if (llvm_code_address(sections, section_count, (u32)address))
+            points[count++] = (u32)address;
+        extra_points = *end == ',' ? end + 1 : end;
+    }
     if (symbols) {
         for (u32 i = 0; i < symbols->count; i++) {
             u32 address = symbols->symbols[i].address;
@@ -464,6 +658,107 @@ static int append_llvm_abi_edge(DolLLVMCallEdge** edges, u32* count,
     return 1;
 }
 
+/* DOLRECOMP_CLOSED_ROOTS=<hex address>[,...]: the closed set is every function
+   that starts at a listed address or is reached from one by direct calls and
+   branches to a function's first instruction. "all" selects every function. */
+static void mark_llvm_closed_set(DolLLVMFunctionRange* ranges, u32 range_count,
+                                 const u32* pairs, u32 pair_count) {
+    const char* text = getenv("DOLRECOMP_CLOSED_ROOTS");
+    if (!text || !*text)
+        return;
+    u32 marked = 0;
+    if (strcmp(text, "all") == 0) {
+        for (u32 i = 0; i < range_count; i++) {
+            ranges[i].abi_flags |= DOLLLVM_FUNCTION_ABI_CLOSED;
+            marked++;
+        }
+    } else {
+        while (*text) {
+            char* end = NULL;
+            u32 address = (u32)strtoul(text, &end, 16);
+            if (end == text)
+                break;
+            for (u32 i = 0; i < range_count; i++)
+                if (ranges[i].start == address)
+                    ranges[i].abi_flags |= DOLLLVM_FUNCTION_ABI_CLOSED;
+            text = *end == ',' ? end + 1 : end;
+        }
+        int changed = 1;
+        while (changed) {
+            changed = 0;
+            for (u32 e = 0; e < pair_count; e++) {
+                u32 caller = pairs[e * 2u], callee = pairs[e * 2u + 1u];
+                if ((ranges[caller].abi_flags & DOLLLVM_FUNCTION_ABI_CLOSED) &&
+                    !(ranges[callee].abi_flags & DOLLLVM_FUNCTION_ABI_CLOSED)) {
+                    ranges[callee].abi_flags |= DOLLLVM_FUNCTION_ABI_CLOSED;
+                    if (getenv("DOLRECOMP_CLOSED_DEBUG"))
+                        fprintf(stderr, "  closed edge %08X -> %08X\n",
+                                ranges[caller].start, ranges[callee].start);
+                    changed = 1;
+                }
+            }
+        }
+        for (u32 i = 0; i < range_count; i++)
+            marked += (ranges[i].abi_flags & DOLLLVM_FUNCTION_ABI_CLOSED) != 0;
+    }
+    /* DOLRECOMP_CLOSED_EXCLUDE=<hex address>[,...]: functions that never get a
+       closed body, whatever reaches them (a loop the host skips as idle must
+       keep ending dispatches at its head, which only an ordinary body does).
+       Calls to them use the ordinary protocol. */
+    const char* excluded = getenv("DOLRECOMP_CLOSED_EXCLUDE");
+    while (excluded && *excluded) {
+        char* end = NULL;
+        u32 address = (u32)strtoul(excluded, &end, 16);
+        if (end == excluded)
+            break;
+        for (u32 i = 0; i < range_count; i++)
+            if (address >= ranges[i].start && address < ranges[i].end)
+                ranges[i].abi_flags &= ~(u32)DOLLLVM_FUNCTION_ABI_CLOSED;
+        excluded = *end == ',' ? end + 1 : end;
+    }
+    /* What a closed body may write before it returns normally: its own
+       writes and those of the closed bodies it calls or branches to. A
+       transfer to a function outside the set uses the ordinary protocol and
+       makes the caller opaque. */
+    u32 opaque = 0;
+    for (u32 i = 0; i < range_count; i++)
+        memcpy(ranges[i].closed_may_def, ranges[i].may_def_state,
+               sizeof(ranges[i].closed_may_def));
+    int grown = 1;
+    while (grown) {
+        grown = 0;
+        for (u32 e = 0; e < pair_count; e++) {
+            DolLLVMFunctionRange* caller = &ranges[pairs[e * 2u]];
+            const DolLLVMFunctionRange* callee = &ranges[pairs[e * 2u + 1u]];
+            if (!(caller->abi_flags & DOLLLVM_FUNCTION_ABI_CLOSED))
+                continue;
+            if (!caller->closed_opaque &&
+                (callee->closed_opaque ||
+                 !(callee->abi_flags & DOLLLVM_FUNCTION_ABI_CLOSED))) {
+                caller->closed_opaque = 1;
+                grown = 1;
+            }
+            for (u32 w = 0; w < DOLIR_STATE_MASK_WORDS; w++) {
+                u64 merged = caller->closed_may_def[w] | callee->closed_may_def[w];
+                if (merged != caller->closed_may_def[w]) {
+                    caller->closed_may_def[w] = merged;
+                    grown = 1;
+                }
+            }
+        }
+    }
+    for (u32 i = 0; i < range_count; i++) {
+        if (!(ranges[i].abi_flags & DOLLLVM_FUNCTION_ABI_CLOSED))
+            continue;
+        opaque += ranges[i].closed_opaque != 0;
+        if (getenv("DOLRECOMP_CLOSED_DEBUG"))
+            fprintf(stderr, "  closed member %08X%s\n", ranges[i].start,
+                    ranges[i].closed_opaque ? " opaque" : "");
+    }
+    fprintf(stderr, "  closed set: %u functions, %u of them opaque\n", marked,
+            opaque);
+}
+
 static int prepare_llvm_function_abis(const LoadedCodeSection* sections,
                                       u32 section_count,
                                       DolLLVMFunctionRange* ranges,
@@ -471,6 +766,12 @@ static int prepare_llvm_function_abis(const LoadedCodeSection* sections,
     DolLLVMCallEdge* edges = NULL;
     u32 edge_count = 0;
     u32 edge_capacity = 0;
+    /* Control transfers to another range's first instruction, as pairs of
+       range indexes, for the closed set. */
+    u32* closed_pairs = NULL;
+    u32 closed_pair_count = 0;
+    u32 closed_pair_capacity = 0;
+    const int want_closed = getenv("DOLRECOMP_CLOSED_ROOTS") != NULL;
     for (u32 range_index = 0; range_index < range_count; range_index++) {
         const LoadedCodeSection* section = NULL;
     for (u32 s = 0; s < section_count; s++) {
@@ -508,8 +809,28 @@ static int prepare_llvm_function_abis(const LoadedCodeSection* sections,
                 goto fail;
             }
             const DolIRFunction* function = &module.functions[0];
+            ranges[range_index].closed_opaque = 0;
             for (u32 block = 0; block < function->block_count; block++) {
             const DolIRTerminator* term = &function->blocks[block].terminator;
+            /* For the closed set: an indirect call, or a runtime helper that
+               may write registers the IR does not list, makes the function
+               opaque (see DolLLVMFunctionRange.closed_opaque). */
+            if (term->kind == DOLIR_TERM_INDIRECT && term->linked)
+                ranges[range_index].closed_opaque = 1;
+            for (u32 n = 0; n < function->blocks[block].instruction_count; n++) {
+                const DolIRInstruction* inst =
+                    &function->blocks[block].instructions[n];
+                if (inst->op == DOLIR_OP_HELPER_CALL &&
+                    inst->aux != DOLIR_HELPER_FP_AVAILABLE &&
+                    inst->aux != DOLIR_HELPER_FPSCR_UPDATED &&
+                    inst->aux != DOLIR_HELPER_FPSCR_BIT &&
+                    inst->aux != DOLIR_HELPER_PSQ_LOAD &&
+                    inst->aux != DOLIR_HELPER_PSQ_STORE &&
+                    inst->aux != DOLIR_HELPER_MEMORY_FENCE &&
+                    inst->aux != DOLIR_HELPER_EXACT_FLOAT &&
+                    inst->aux != DOLIR_HELPER_EXACT_PAIRED)
+                    ranges[range_index].closed_opaque = 1;
+            }
             u64 live_after[DOLIR_STATE_MASK_WORDS] = {0};
             u64 defined_before[DOLIR_STATE_MASK_WORDS] = {0};
             if (!dolllvm_analyze_callsite_state(
@@ -535,6 +856,38 @@ static int prepare_llvm_function_abis(const LoadedCodeSection* sections,
                         dolir_module_free(&module);
                         goto fail;
                     }
+                    /* Not the address after an unconditional blr/bctr, which
+                       the terminator lists but control never reaches. */
+                    u32 raw = function->blocks[block].raw;
+                    int never = term->kind == DOLIR_TERM_INDIRECT &&
+                                slot == 1u && ((raw >> 21) & 0x14u) == 0x14u;
+                    /* Into the middle of another function: the ordinary
+                       protocol. */
+                    if (target && !never &&
+                        target->start != ranges[range_index].start &&
+                        target->start != term->target_addresses[slot])
+                        ranges[range_index].closed_opaque = 1;
+                    if (want_closed && target && !never &&
+                        target->start != ranges[range_index].start &&
+                        target->start == term->target_addresses[slot]) {
+                        if (closed_pair_count == closed_pair_capacity) {
+                            u32 next = closed_pair_capacity
+                                           ? closed_pair_capacity * 2u
+                                           : 1024u;
+                            u32* resized = (u32*)realloc(
+                                closed_pairs, (size_t)next * 2u * sizeof(u32));
+                            if (!resized) {
+                                dolir_module_free(&module);
+                                goto fail;
+                            }
+                            closed_pairs = resized;
+                            closed_pair_capacity = next;
+                        }
+                        closed_pairs[closed_pair_count * 2u] = range_index;
+                        closed_pairs[closed_pair_count * 2u + 1u] =
+                            (u32)(target - ranges);
+                        closed_pair_count++;
+                    }
                 }
             }
             dolir_module_free(&module);
@@ -544,9 +897,12 @@ static int prepare_llvm_function_abis(const LoadedCodeSection* sections,
     if (!dolllvm_propagate_function_abis(ranges, range_count, edges,
                                          edge_count))
         goto fail;
+    mark_llvm_closed_set(ranges, range_count, closed_pairs, closed_pair_count);
+    free(closed_pairs);
     free(edges);
     return 1;
 fail:
+    free(closed_pairs);
     free(edges);
     return 0;
 }
@@ -664,9 +1020,34 @@ static void cache_llvm_object(const LLVMChunkJob* job) {
         remove(temp);
 }
 
+/* DOLRECOMP_LLVM_ONLY="8006E1F0,801BA73C,...": emit only the chunks that
+   contain one of the listed guest addresses and skip every other one, for
+   inspecting generated code in seconds. The output is not a linkable module. */
+static int llvm_job_selected(const LLVMChunkJob* job) {
+    const char* only = getenv("DOLRECOMP_LLVM_ONLY");
+    if (!only || !only[0])
+        return 1;
+    const u32 start = job->function_address;
+    const u32 end = start + job->count * 4u;
+    for (const char* p = only; *p;) {
+        char* next = NULL;
+        unsigned long address = strtoul(p, &next, 16);
+        if (next == p)
+            break;
+        if ((u32)address >= start && (u32)address < end)
+            return 1;
+        p = next;
+        while (*p == ',' || *p == ' ')
+            p++;
+    }
+    return 0;
+}
+
 static int emit_llvm_chunk_job(const void* data, void* user) {
     const LLVMChunkJob* job = (const LLVMChunkJob*)data;
     (void)user;
+    if (!llvm_job_selected(job))
+        return 1;
     if (reuse_llvm_object(job))
         return 1;
     char temp_path[1440];
@@ -687,7 +1068,21 @@ static int emit_llvm_chunk_job(const void* data, void* user) {
         dolir_module_free(&module);
         return 0;
     }
+    for (u32 i = 0; i < job->import_count; i++) {
+        PPCInst* imported = decode_guest_code(job->sections, job->section_count,
+                                              job->imports[i].start,
+                                              job->imports[i].count);
+        int built = imported &&
+                    dolir_build_chunk(&module, imported, job->imports[i].count,
+                                      job->imports[i].start);
+        free(imported);
+        if (!built || !dolir_verify(&module, stderr)) {
+            dolir_module_free(&module);
+            return 0;
+        }
+    }
     DolLLVMOptions options = {0};
+    options.own_function_count = job->import_count ? 1u : 0u;
     options.target_triple = getenv("DOLRECOMP_LLVM_TARGET");
     options.target_profile = job->target_profile;
     options.semantics = job->semantics;
@@ -1162,6 +1557,12 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
                 target_job->profile_use_path = options->profile_use_path;
                 target_job->partition_seed = options->partition_seed;
                 target_job->state_in_memory = options->state_in_memory;
+                target_job->sections = sections;
+                target_job->section_count = section_count;
+                collect_llvm_imports(target_job, target_job->insts,
+                                     target_job->count,
+                                     target_job->function_address,
+                                     llvm_inline_callee_limit());
                 target_job->ram_size = GC_MAIN_RAM_SIZE;
                 target_job->mem2_size =
                     cpu == DOLRECOMP_CPU_GEKKO ? 0u : WII_MEM2_SIZE;

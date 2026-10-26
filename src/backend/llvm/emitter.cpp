@@ -1,4 +1,7 @@
+#include <cstdlib>
 #include "backend/llvm/emitter.h"
+#include "backend/codegen_switches.h"
+#include "backend/llvm/fp_fixups.h"
 #include "cpu/cpu.h"
 
 #include <cstdio>
@@ -36,6 +39,51 @@ FunctionEmitter::FunctionEmitter(LLVMContext &context, Module &module,
       expected_ram_size_(options.ram_size),
       expected_mem2_size_(options.mem2_size) {
   const Triple triple(module_.getTargetTriple());
+  triple_is_x86_ = triple.isX86();
+  inline_scalar_fp_ = !modern_runtime_ && dolrecomp_codegen_switch_is(
+                                              "DOLRECOMP_SCALAR_FP", "inline");
+  jit64_paired_fp_ =
+      dolrecomp_codegen_switch_is("DOLRECOMP_PAIRED_FP", "jit64");
+  hardware_fma_ = dolrecomp_codegen_switch_is("DOLRECOMP_FMA", "hw");
+  guard_paired_fma_ =
+      dolrecomp_codegen_switch_is("DOLRECOMP_PS_MADD", "guarded");
+  lazy_fprf_ = !modern_runtime_ &&
+               dolrecomp_codegen_switch_is("DOLRECOMP_FPRF", "lazy");
+  defer_cycles_ = !modern_runtime_ &&
+                  dolrecomp_codegen_switch_is("DOLRECOMP_CYCLES", "deferred");
+  inline_fpscr_ = !modern_runtime_ && triple_is_x86_ &&
+                  dolrecomp_codegen_switch_is("DOLRECOMP_FPSCR", "inline");
+  float_single_math_ =
+      inline_scalar_fp_ &&
+      dolrecomp_codegen_switch_is("DOLRECOMP_SINGLE_MATH", "float");
+  track_singles_ = !modern_runtime_ && trackSingles();
+  if (track_singles_)
+    float_single_math_ = true;
+  native_indirect_calls_ =
+      !modern_runtime_ &&
+      dolrecomp_codegen_switch_is("DOLRECOMP_INDIRECT_CALLS", "native");
+  closed_defer_ = dolrecomp_codegen_switch_is("DOLRECOMP_CLOSED_DEFER", "1");
+  inline_gather_pipe_ =
+      !modern_runtime_ && !native_abi_ && !write_journal_ &&
+      dolrecomp_codegen_switch_is("DOLRECOMP_GATHER_PIPE", "inline");
+  entry_check_ = !modern_runtime_ && !native_abi_ &&
+                 !dolrecomp_codegen_switch_is("DOLRECOMP_ENTRY_CHECK", "off");
+  register_counters_ =
+      !modern_runtime_ && !native_abi_ &&
+      dolrecomp_codegen_switch_is("DOLRECOMP_CALL_COUNTERS", "registers");
+  for (u32 i = 0; register_counters_ && i < range_count_; i++)
+    if (ranges_[i].abi_flags & DOLLLVM_FUNCTION_ABI_NATIVE)
+      register_counters_ = false;
+  entry_query_ = !dolrecomp_codegen_switch_is("DOLRECOMP_ENTRY_QUERY", "off");
+  split_entry_loads_ =
+      !modern_runtime_ && !native_abi_ &&
+      dolrecomp_codegen_switch_is("DOLRECOMP_ENTRY_LOADS", "split");
+  scoped_alias_ = !modern_runtime_ &&
+                  dolrecomp_codegen_switch_is("DOLRECOMP_STATE_ALIAS", "scoped");
+  sync_changed_ = !modern_runtime_ && !state_in_memory_ &&
+                  dolrecomp_codegen_switch_is("DOLRECOMP_STATE_SYNC", "changed");
+  lazy_state_ = sync_changed_ &&
+                dolrecomp_codegen_switch_is("DOLRECOMP_STATE_LAZY", "regions");
   intrinsic_escapes_ = triple.isX86() && !modern_runtime_;
   cold_escapes_ = modern_runtime_ || intrinsic_escapes_ ||
                   (triple.isAArch64() && !triple.isOSWindows());
@@ -46,14 +94,27 @@ FunctionEmitter::FunctionEmitter(LLVMContext &context, Module &module,
     native_abi_ = (abi_range_->abi_flags & DOLLLVM_FUNCTION_ABI_NATIVE) != 0;
     break;
   }
+  if (native_abi_) {
+    sync_changed_ = false;
+    inline_gather_pipe_ = false;
+    if (track_singles_)
+      float_single_math_ = dolrecomp_codegen_switch_is("DOLRECOMP_SINGLE_MATH",
+                                                       "float");
+    track_singles_ = false;
+  }
 }
 
 bool FunctionEmitter::emit(raw_ostream &diagnostics) {
   if (modern_runtime_ && !native_abi_)
     return true;
-  auto *type = bodyFunctionType(abi_range_);
+  if (closed_ && !closedCapable()) {
+    diagnostics << "dolllvm: no closed body possible for " << source_.name
+                << "\n";
+    return false;
+  }
+  auto *type = closed_ ? closedFunctionType() : bodyFunctionType(abi_range_);
   const std::string bodyName =
-      symbolName(std::string(source_.name) + "_budget");
+      symbolName(std::string(source_.name) + (closed_ ? "_closed" : "_budget"));
   function_ = module_.getFunction(bodyName);
   if (!function_)
     function_ =
@@ -65,6 +126,14 @@ bool FunctionEmitter::emit(raw_ostream &diagnostics) {
   function_->setCallingConv(bodyCallingConvention());
   function_->setVisibility(GlobalValue::HiddenVisibility);
   function_->setDSOLocal(true);
+  function_->addFnAttr("dolrecomp-guest-body");
+  if (!closed_)
+    countHere(source_.guest_start, 6,
+              (source_.guest_end - source_.guest_start) / 4u, false);
+  if (imported_) {
+    function_->setLinkage(GlobalValue::AvailableExternallyLinkage);
+    function_->addFnAttr(Attribute::AlwaysInline);
+  }
   u32 fixedArgument = 0;
   ctx_ = function_->getArg(fixedArgument++);
   ctx_->setName("ctx");
@@ -78,10 +147,21 @@ bool FunctionEmitter::emit(raw_ostream &diagnostics) {
     state_interface_->setName("state_interface");
     state_interface_->addAttr(Attribute::NonNull);
   }
-  chain_ = function_->getArg(fixedArgument++);
-  chain_->setName("chain");
+  if (closed_) {
+    // Never dereferenced with the counters in registers.
+    chain_ = ConstantPointerNull::get(PointerType::getUnqual(context_));
+  } else {
+    chain_ = function_->getArg(fixedArgument++);
+    chain_->setName("chain");
+  }
   control_pc_ = function_->getArg(fixedArgument++);
   control_pc_->setName("control_pc");
+  if (register_counters_) {
+    initial_cycles_ = function_->getArg(fixedArgument++);
+    initial_cycles_->setName("cycles_in");
+    initial_guard_ = function_->getArg(fixedArgument++);
+    initial_guard_->setName("guard_in");
+  }
   if (native_abi_) {
     u32 argument = fixedArgument;
     if (nativeCyclesInResult(abi_range_)) {
@@ -108,6 +188,16 @@ bool FunctionEmitter::emit(raw_ostream &diagnostics) {
   scanContinuations();
   scanLoopHeaders();
   scanRegionLeaders();
+  scanLazyState();
+  if (track_singles_ && single_plan_) {
+    if (usesFPRegisters()) {
+      region_out_.assign(source_.block_count, SingleFacts());
+      region_done_.assign(source_.block_count, 0);
+      guessSinglePlan();
+    } else {
+      single_plan_ = nullptr;
+    }
+  }
   blocks_.resize(source_.block_count);
   BasicBlock *region = nullptr;
   for (u32 i = 0; i < source_.block_count; i++) {
@@ -135,9 +225,38 @@ bool FunctionEmitter::emit(raw_ostream &diagnostics) {
       return false;
   }
   emitFallbackHandler();
+  if (track_singles_ && single_plan_ && !settleSinglePlan()) {
+    // The assumptions about single views did not hold on every edge; they
+    // have been narrowed. Drop this body; the caller emits it again.
+    single_seeds_rejected_ = true;
+    function_->deleteBody();
+    const std::string prefix = std::string(source_.name) + "_fallback_";
+    SmallVector<GlobalVariable *, 4> stale;
+    for (GlobalVariable &global : module_.globals()) {
+      if (!global.hasPrivateLinkage() || !global.getName().starts_with(prefix))
+        continue;
+      global.removeDeadConstantUsers();
+      if (global.use_empty())
+        stale.push_back(&global);
+    }
+    for (GlobalVariable *global : stale)
+      global->eraseFromParent();
+    return true;
+  }
+  if (track_singles_)
+    reportSingleStats();
   finalizeStateSSA();
+  if (hardware_fma_ && uses_fma_ && triple_is_x86_) {
+    // Only where a fused multiply-add is emitted. The backend turns this mark
+    // into the "fma" target feature after the IR has been optimized, so that
+    // instruction selection is the only thing that sees it.
+    function_->addFnAttr(kHostFMAAttribute);
+    markFMAFixups(module_);
+  }
   if (verifyFunction(*function_, &diagnostics))
     return false;
+  if (imported_ || closed_)
+    return true;
   return emitWrapper(diagnostics);
 }
 

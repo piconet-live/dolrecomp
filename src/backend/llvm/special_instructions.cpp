@@ -15,8 +15,24 @@ void FunctionEmitter::emitStateWrite(const DolIRInstruction &inst) {
   auto slot = static_cast<DolIRStateSlot>(inst.aux);
   Value *value = operand(inst, 0);
   if (slot != DOLIR_STATE_MSR) {
+    if (slot == DOLIR_STATE_FPSCR && inline_fpscr_)
+      fpscr_before_write_ = builder_.CreateLoad(Type::getInt32Ty(context_),
+                                                state_[inst.aux]);
     builder_.CreateStore(value, state_[inst.aux]);
+    if (track_singles_ && slot >= DOLIR_STATE_FPR0 &&
+        slot <= DOLIR_STATE_PS1_31) {
+      const u32 reg = slot - (slot <= DOLIR_STATE_FPR31 ? DOLIR_STATE_FPR0
+                                                        : DOLIR_STATE_PS1_0);
+      const FPRepresentation rep = fp_rep_[reg];
+      const bool exact = fp_exact_single_[reg];
+      const bool safe = fp_denormal_safe_[reg];
+      const bool canonical = fp_single_canonical_[reg];
+      noteStateWrite(slot, value);
+      noteTrackedLaneWrite(slot, value, rep, exact, safe, canonical);
+      return;
+    }
     noteStateWrite(slot, value);
+    noteFloatLaneWrite(slot, value);
     return;
   }
 
@@ -24,6 +40,10 @@ void FunctionEmitter::emitStateWrite(const DolIRInstruction &inst) {
       builder_.CreateLoad(Type::getInt32Ty(context_), state_[inst.aux]);
   builder_.CreateStore(value, state_[inst.aux]);
   noteStateWrite(slot, value);
+  // DOLRECOMP_CLOSED_DEFER: a closed body goes on; an interrupt that is
+  // pending is delivered when control next reaches the run loop.
+  if (closed_ && closed_defer_)
+    return;
   Value *enabled = builder_.CreateAnd(builder_.CreateNot(old), value);
   enabled = builder_.CreateICmpNE(
       builder_.CreateAnd(enabled, builder_.getInt32(0x8000)),
@@ -92,14 +112,17 @@ Value *FunctionEmitter::emitFPAvailable(u32 pc) {
                                             {PointerType::getUnqual(context_),
                                              Type::getInt32Ty(context_)},
                                             false));
-  Value *available = builder_.CreateCall(callee, {ctx_, builder_.getInt32(pc)});
+  CallInst *available =
+      builder_.CreateCall(callee, {ctx_, builder_.getInt32(pc)});
+  tagRuntimeCall(available, RegisterWrites::None);
   BasicBlock *reload = BasicBlock::Create(context_, "fp_reload", function_);
   BasicBlock *bad = BasicBlock::Create(context_, "fp_exit", function_);
   builder_.CreateCondBr(available, reload, bad);
   builder_.SetInsertPoint(bad);
   returnFromBody();
   builder_.SetInsertPoint(reload);
-  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
+  // A successful check changes no guest register.
+  for (u32 slot = 0; slot < DOLIR_STATE_COUNT && !sync_changed_; slot++) {
     if (used_[slot]) {
       auto stateSlot = static_cast<DolIRStateSlot>(slot);
       Value *reloaded = loadContext(stateSlot);

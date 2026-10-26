@@ -26,6 +26,8 @@ void FunctionEmitter::emitExactFloat(u64 descriptor) {
   };
   Type *ptr = PointerType::getUnqual(context_);
   Type *f64 = Type::getDoubleTy(context_);
+  if (inline_scalar_fp_ && emitInlineScalarFloat(op, d, a, b, c, crfd))
+    return;
   syncState(DOLIR_STATE_FPSCR);
 
   if (op == DOLIR_EXACT_FCMPU || op == DOLIR_EXACT_FCMPO) {
@@ -46,6 +48,7 @@ void FunctionEmitter::emitExactFloat(u64 descriptor) {
 
   fp_rep_[d] = FPRepresentation::Raw;
   fp_exact_single_[d] = false;
+  fp_ps0_single_[d] = false;
   fp_denormal_safe_[d] = false;
 
   DolIRStateSlot destination = fprSlot(d);
@@ -178,6 +181,11 @@ void FunctionEmitter::emitExactFloat(u64 descriptor) {
                            state_[ps1]);
     }
   }
+  if (op >= DOLIR_EXACT_FRES && op <= DOLIR_EXACT_FCTIWZ) {
+    // These helpers return the result; the stores above wrote the host copy.
+    markWritten(destination);
+    markWritten(ps1Slot(d));
+  }
   reloadState(DOLIR_STATE_FPSCR);
   bool singleResult = (op >= DOLIR_EXACT_FADDS && op <= DOLIR_EXACT_FDIVS) ||
                       op == DOLIR_EXACT_FRSP ||
@@ -188,6 +196,7 @@ void FunctionEmitter::emitExactFloat(u64 descriptor) {
     builder_.CreateStore(single, pair_f32_[d]);
     fp_rep_[d] = FPRepresentation::PairF32;
     fp_exact_single_[d] = true;
+    fp_track_view_[d] = false;
     fp_denormal_safe_[d] = true;
   }
 }

@@ -10,6 +10,11 @@ extern "C" {
 typedef enum {
   DOLLLVM_FUNCTION_ABI_NATIVE = 1u << 0,
   DOLLLVM_FUNCTION_ABI_NATIVE_MEMORY = 1u << 1,
+  // The function is in the closed set (DOLRECOMP_CLOSED_ROOTS): besides its
+  // ordinary body the backend emits func_<address>_closed, which is entered
+  // at the function's first instruction only and called by other closed
+  // bodies with the closed protocol (emitter.h).
+  DOLLLVM_FUNCTION_ABI_CLOSED = 1u << 2,
 } DolLLVMFunctionABIFlag;
 
 typedef enum {
@@ -40,6 +45,13 @@ typedef struct {
   u32 native_call_depth;
   u32 abi_blockers;
   u32 abi_flags;
+  // For a function of the closed set: the state its closed body and the
+  // closed bodies it calls may write before it returns normally. Meaningless
+  // when closed_opaque is set: the function (or one it calls with the closed
+  // protocol) makes a call with the ordinary protocol, an indirect call, or
+  // uses a runtime helper whose writes the IR does not list.
+  u64 closed_may_def[DOLIR_STATE_MASK_WORDS];
+  u32 closed_opaque;
 } DolLLVMFunctionRange;
 
 typedef struct {
@@ -103,6 +115,10 @@ typedef struct {
   u32 function_range_count;
   const u32 *entry_points;
   u32 entry_point_count;
+  // When nonzero, the module's functions from this index on are imported
+  // callees: emitted as available_externally definitions that LLVM inlines
+  // into the functions before them and does not write to the object.
+  u32 own_function_count;
 } DolLLVMOptions;
 
 bool dolllvm_emit_object(const DolIRModule *module, const char *object_path,

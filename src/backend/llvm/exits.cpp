@@ -1,9 +1,13 @@
 #include "backend/llvm/emitter.h"
 #include "cpu/cpu.h"
 
+#include <cstdio>
+
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
 
 namespace dolllvm {
@@ -16,7 +20,10 @@ void FunctionEmitter::emitEntry() {
   guard_cycles_ = builder_.CreateStructGEP(chainTy, chain_, 1);
   guard_steps_ = builder_.CreateStructGEP(chainTy, chain_, 2);
   pending_cycles_ = builder_.CreateStructGEP(chainTy, chain_, 3);
-  entry_pc_ = builder_.CreateTrunc(control_pc_, Type::getInt32Ty(context_));
+  entry_pc_ = closed_ ? static_cast<Value *>(
+                            builder_.getInt32(source_.guest_start))
+                      : builder_.CreateTrunc(control_pc_,
+                                             Type::getInt32Ty(context_));
   return_pc_ = builder_.CreateTrunc(
       builder_.CreateLShr(control_pc_, builder_.getInt64(32)),
       Type::getInt32Ty(context_));
@@ -31,7 +38,8 @@ void FunctionEmitter::emitEntry() {
           : builder_.CreateLoad(Type::getInt64Ty(context_), pending_cycles_);
   builder_.CreateStore(initialCycles, cycles_);
   Value *initialGuard =
-      native_abi_ && cold_escapes_
+      initial_guard_ ? static_cast<Value *>(initial_guard_)
+      : native_abi_ && cold_escapes_
           ? static_cast<Value *>(builder_.getInt64(0))
           : builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_);
   builder_.CreateStore(initialGuard, guard_cycles_local_);
@@ -52,16 +60,55 @@ void FunctionEmitter::emitEntry() {
     pair_f32_[reg] = builder_.CreateAlloca(pairF32, nullptr, "pair.f32");
     pair_f64_[reg] = builder_.CreateAlloca(pairF64, nullptr, "pair.f64");
   }
-  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
-    if (!used_[slot])
-      continue;
-    auto stateSlot = static_cast<DolIRStateSlot>(slot);
-    if (slotInMemory(stateSlot))
-      continue;
-    Value *initial = native_abi_ && native_inputs_[slot]
-                         ? static_cast<Value *>(native_inputs_[slot])
-                         : loadContext(stateSlot);
-    builder_.CreateStore(initial, state_[slot]);
+  auto loadRegisters = [&] {
+    for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
+      if (!used_[slot])
+        continue;
+      auto stateSlot = static_cast<DolIRStateSlot>(slot);
+      if (slotInMemory(stateSlot))
+        continue;
+      Value *initial = native_abi_ && native_inputs_[slot]
+                           ? static_cast<Value *>(native_inputs_[slot])
+                           : loadContext(stateSlot);
+      builder_.CreateStore(initial, state_[slot]);
+    }
+  };
+  if (!split_entry_loads_)
+    loadRegisters();
+  if (entry_check_) {
+    char name[64];
+    snprintf(name, sizeof(name), "dolrecomp_native_valid_%08X",
+             source_.guest_start);
+    Type *i8 = Type::getInt8Ty(context_);
+    GlobalVariable *valid = module_.getGlobalVariable(symbolName(name));
+    if (!valid)
+      // An imported copy (DOLRECOMP_INLINE_CALLEES) refers to the byte the
+      // function's own object defines.
+      valid = new GlobalVariable(module_, i8, false,
+                                 GlobalValue::ExternalLinkage,
+                                 imported_ ? nullptr : builder_.getInt8(1),
+                                 symbolName(name));
+    valid->setDSOLocal(true);
+    // A closed body tests the function's "may be entered closed" byte
+    // instead (closedPermission): it is zero whenever the valid byte is.
+    if (closed_)
+      valid = closedPermission();
+    else if (closedBuild())
+      closedPermission();
+    BasicBlock *checked =
+        BasicBlock::Create(context_, "entry_valid", function_);
+    BasicBlock *stale = BasicBlock::Create(context_, "entry_stale", function_);
+    builder_.CreateCondBr(
+        builder_.CreateICmpNE(builder_.CreateLoad(i8, valid),
+                              builder_.getInt8(0)),
+        checked, stale, MDBuilder(context_).createBranchWeights(1000000, 1));
+    builder_.SetInsertPoint(stale);
+    // Nothing has changed yet: the PC and the cycle count go back, and the
+    // run loop decides what runs this code.
+    storeContext(DOLIR_STATE_PC, entry_pc_);
+    settleCycles();
+    returnFromBody();
+    builder_.SetInsertPoint(checked);
   }
   BasicBlock *nativeEntry =
       BasicBlock::Create(context_, "native_entry", function_);
@@ -69,13 +116,21 @@ void FunctionEmitter::emitEntry() {
       BasicBlock::Create(context_, "interception_query", function_);
   Function *expect = Intrinsic::getDeclaration(&module_, Intrinsic::expect,
                                                {Type::getInt1Ty(context_)});
-  if (modern_runtime_) {
+  Value *hostCall = nullptr;
+  if (closed_) {
+    // Entered only while the host has no call hook (emitClosedHandover).
+    builder_.CreateBr(nativeEntry);
+  } else if (modern_runtime_) {
     builder_.CreateBr(query);
   } else {
-    Value *hostCall = loadOffset(pointer, offsetof(CPUState, host_call));
+    hostCall = tagEnvironmentLoad(cast<LoadInst>(
+        loadOffset(pointer, offsetof(CPUState, host_call))));
     Value *noInterception = builder_.CreateCall(
         expect, {builder_.CreateIsNull(hostCall), builder_.getTrue()});
-    builder_.CreateCondBr(noInterception, nativeEntry, query);
+    if (entry_query_)
+      builder_.CreateCondBr(noInterception, nativeEntry, query);
+    else
+      builder_.CreateBr(nativeEntry);  // DOLRECOMP_ENTRY_QUERY=off
   }
   builder_.SetInsertPoint(query);
   FunctionCallee available;
@@ -96,9 +151,16 @@ void FunctionEmitter::emitEntry() {
             Type::getInt1Ty(context_),
             {pointer, Type::getInt32Ty(context_), Type::getInt32Ty(context_)},
             false));
-    canEnter = builder_.CreateCall(
+    CallInst *query = builder_.CreateCall(
         available, {ctx_, builder_.getInt32(source_.guest_start),
                     builder_.getInt32(source_.guest_end)});
+    // The query only answers; it must not run a hook. A region that is
+    // intercepted is never entered in place: the branch below leaves through
+    // an exit, the runtime runs the hook from the run loop, and the function
+    // is re-entered with every register reloaded. That is what allows the
+    // query to be marked as leaving the guest registers alone.
+    tagRuntimeCall(query, RegisterWrites::None);
+    canEnter = query;
   }
   canEnter = builder_.CreateCall(expect, {canEnter, builder_.getTrue()});
   BasicBlock *intercept =
@@ -108,7 +170,14 @@ void FunctionEmitter::emitEntry() {
   if (modern_runtime_)
     builder_.CreateStore(builder_.getInt32(4),
                          builder_.CreateStructGEP(chainType(), chain_, 7));
-  materialize(entry_pc_);
+  if (split_entry_loads_) {
+    // Nothing has been loaded and nothing has changed: only the PC and the
+    // cycle count go back.
+    storeContext(DOLIR_STATE_PC, entry_pc_);
+    settleCycles();
+  } else {
+    materialize(entry_pc_);
+  }
   returnFromBody();
 
   builder_.SetInsertPoint(nativeEntry);
@@ -118,13 +187,18 @@ void FunctionEmitter::emitEntry() {
     mem2_ = runtimeField(6);
     mem2_size_ = runtimeField(7);
   } else {
-    ram_ = loadOffset(pointer, offsetof(CPUState, ram));
-    ram_size_ =
-        loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, ram_size));
-    mem2_ = loadOffset(pointer, offsetof(CPUState, exram));
-    mem2_size_ =
-        loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exram_size));
+    ram_ = tagEnvironmentLoad(
+        cast<LoadInst>(loadOffset(pointer, offsetof(CPUState, ram))));
+    ram_size_ = tagEnvironmentLoad(cast<LoadInst>(
+        loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, ram_size))));
+    mem2_ = tagEnvironmentLoad(
+        cast<LoadInst>(loadOffset(pointer, offsetof(CPUState, exram))));
+    mem2_size_ = tagEnvironmentLoad(cast<LoadInst>(loadOffset(
+        Type::getInt32Ty(context_), offsetof(CPUState, exram_size))));
   }
+  ram_biased_ = builder_.CreateGEP(
+      Type::getInt8Ty(context_), ram_,
+      builder_.getInt64(-static_cast<int64_t>(GC_RAM_BASE)), "ram.biased");
   Function *assume = Intrinsic::getDeclaration(&module_, Intrinsic::assume);
   Value *ramSizeValid =
       fixed_memory_layout_
@@ -144,15 +218,50 @@ void FunctionEmitter::emitEntry() {
     builder_.CreateCall(assume, {mem2SizeValid});
   }
   initializeEntryControls();
+  if (closed_) {
+    // One way in: the first instruction.
+    loadRegisters();
+    builder_.CreateBr(blocks_[0]);
+    return;
+  }
   BasicBlock *bad = BasicBlock::Create(context_, "entry_miss", function_);
   u32 nativeEntries = 0;
   for (u32 i = 0; i < source_.block_count; i++)
     nativeEntries += region_leaders_[i] &&
                      source_.blocks[i].terminator.kind != DOLIR_TERM_FALLBACK;
+  bool startHandled = false;
+  if (split_entry_loads_) {
+    BasicBlock *resume =
+        BasicBlock::Create(context_, "resume_entry", function_);
+    if (source_.block_count && region_leaders_[0] &&
+        source_.blocks[0].terminator.kind != DOLIR_TERM_FALLBACK &&
+        source_.blocks[0].guest_address == source_.guest_start) {
+      BasicBlock *start =
+          BasicBlock::Create(context_, "start_entry", function_);
+      Value *atStart = builder_.CreateCall(
+          expect,
+          {builder_.CreateICmpEQ(entry_pc_,
+                                 builder_.getInt32(source_.guest_start)),
+           builder_.getTrue()});
+      builder_.CreateCondBr(atStart, start, resume);
+      builder_.SetInsertPoint(start);
+      if (hostCall && wantsClosedBody())
+        emitClosedHandover(hostCall);
+      loadRegisters();
+      builder_.CreateBr(blocks_[0]);
+      startHandled = true;
+    } else {
+      builder_.CreateBr(resume);
+    }
+    builder_.SetInsertPoint(resume);
+    loadRegisters();
+  }
   auto *dispatch = builder_.CreateSwitch(entry_pc_, bad, nativeEntries);
   for (u32 i = 0; i < source_.block_count; i++) {
     if (!region_leaders_[i] ||
         source_.blocks[i].terminator.kind == DOLIR_TERM_FALLBACK)
+      continue;
+    if (i == 0 && startHandled)
       continue;
     dispatch->addCase(ConstantInt::get(Type::getInt32Ty(context_),
                                        source_.blocks[i].guest_address),
@@ -187,6 +296,26 @@ void FunctionEmitter::syncDirtyState() {
     materializeFPRF();
     if (dirty_[DOLIR_STATE_FPSCR])
       stage(DOLIR_STATE_FPSCR, stateValue(DOLIR_STATE_FPSCR));
+    return;
+  }
+  if (sync_changed_) {
+    // Everything the code up to here changed and has not written yet, then
+    // the packed slots this function ever writes. Nothing is consumed: this
+    // may be a cold path the straight-line code does not go through.
+    storeUnsynced(false);
+    for (u32 slot = DOLIR_STATE_CR; slot < DOLIR_STATE_FPSCR; slot++) {
+      if (!dirty_[slot])
+        continue;
+      auto stateSlot = static_cast<DolIRStateSlot>(slot);
+      storeContext(stateSlot,
+                   builder_.CreateLoad(type(dolir_state_type(stateSlot)),
+                                       state_[slot]));
+    }
+    materializeFPRF(true);
+    if (dirty_[DOLIR_STATE_FPSCR])
+      storeContext(DOLIR_STATE_FPSCR,
+                   builder_.CreateLoad(Type::getInt32Ty(context_),
+                                       state_[DOLIR_STATE_FPSCR]));
     return;
   }
   for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
@@ -268,6 +397,11 @@ void FunctionEmitter::returnFromBody() {
     }
     Value *pc = loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, pc));
     builder_.CreateRet(nativeResult(pc, false, true));
+  } else if (register_counters_) {
+    // Every way out of a closed body through here is an escape; its normal
+    // return is emitted by emitClosedIndirect.
+    builder_.CreateRet(closed_ ? withEscape(counterResult())
+                               : counterResult());
   } else {
     builder_.CreateRetVoid();
   }

@@ -1,4 +1,10 @@
 #include "backend/llvm/emitter.h"
+
+#include <vector>
+
+#include <llvm/IR/GlobalVariable.h>
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/IR/IntrinsicsX86.h>
 #include "cpu/cpu.h"
 
 #include <llvm/ADT/SmallVector.h>
@@ -30,8 +36,9 @@ void FunctionEmitter::syncState(DolIRStateSlot slot) {
 
 void FunctionEmitter::reloadState(DolIRStateSlot slot) {
   known_state_[slot] = nullptr;
+  unsynced_.reset(slot);
   if (slot == DOLIR_STATE_FPSCR)
-    pending_fprf_ = nullptr;
+    clearPendingFPRF();
   if (slotInMemory(slot))
     return;
   builder_.CreateStore(loadContext(slot), state_[slot]);
@@ -99,7 +106,7 @@ void FunctionEmitter::reloadModernState() {
 void FunctionEmitter::reloadUsedState() {
   invalidateFPRepresentations();
   fp_available_checked_ = false;
-  pending_fprf_ = nullptr;
+  clearPendingFPRF();
   known_state_.fill(nullptr);
   psq_direct_proven_ = false;
   psq_indexed_proven_ = false;
@@ -128,7 +135,78 @@ void FunctionEmitter::continueAfterRuntimeBoundary(StringRef prefix) {
   reloadUsedState();
 }
 
+// The host's rounding mode and flush-to-zero state follow FPSCR[RN] and
+// FPSCR[NI]: when those bits differ between `before` and `after` (or `before`
+// is not known), MXCSR is loaded from a table of the eight combinations, as
+// Dolphin's Jit64 does. The runtime helper this replaces reads MXCSR, edits
+// the same bits and writes it back.
+void FunctionEmitter::emitHostFPMode(Value *before, Value *after) {
+  Type *i32 = Type::getInt32Ty(context_);
+  ArrayType *tableType = ArrayType::get(i32, 8);
+  GlobalVariable *table = module_.getGlobalVariable("dolrecomp.mxcsr", true);
+  if (!table) {
+    // index: bit 2 = NI (flush to zero, denormals are zero), bits 1:0 = RN
+    // (nearest, toward zero, up, down); all exceptions masked.
+    static const u32 rounding[4] = {0u << 13, 3u << 13, 2u << 13, 1u << 13};
+    std::vector<Constant *> values;
+    for (u32 index = 0; index < 8; index++)
+      values.push_back(builder_.getInt32(0x1F80u | rounding[index & 3u] |
+                                         ((index & 4u) ? 0x8040u : 0u)));
+    table = new GlobalVariable(module_, tableType, true,
+                               GlobalValue::PrivateLinkage,
+                               ConstantArray::get(tableType, values),
+                               "dolrecomp.mxcsr");
+  }
+  Value *control = builder_.CreateAnd(after, builder_.getInt32(7));
+  BasicBlock *update = BasicBlock::Create(context_, "fp_mode_update", function_);
+  BasicBlock *done = BasicBlock::Create(context_, "fp_mode_done", function_);
+  Value *changed =
+      before ? builder_.CreateICmpNE(
+                   builder_.CreateAnd(builder_.CreateXor(before, after),
+                                      builder_.getInt32(7)),
+                   builder_.getInt32(0))
+             : static_cast<Value *>(builder_.getTrue());
+  builder_.CreateCondBr(changed, update, done);
+  builder_.SetInsertPoint(update);
+  countHere(current_pc_, 2, 0);
+  builder_.CreateCall(
+      Intrinsic::getDeclaration(&module_, Intrinsic::x86_sse_ldmxcsr),
+      {builder_.CreateInBoundsGEP(
+          tableType, table,
+          {builder_.getInt64(0),
+           builder_.CreateZExt(control, Type::getInt64Ty(context_))})});
+  builder_.CreateBr(done);
+  builder_.SetInsertPoint(done);
+}
+
 void FunctionEmitter::emitFPSCRUpdated() {
+  if (inline_fpscr_) {
+    // ppc_fpscr_updated: VX and FEX are summaries of the bits just written.
+    Type *i32 = Type::getInt32Ty(context_);
+    Value *fpscr = builder_.CreateLoad(i32, state_[DOLIR_STATE_FPSCR]);
+    Value *anyInvalid = builder_.CreateICmpNE(
+        builder_.CreateAnd(fpscr, builder_.getInt32(0x01F80700u)),
+        builder_.getInt32(0));
+    fpscr = builder_.CreateOr(
+        builder_.CreateAnd(fpscr, builder_.getInt32(~0x20000000u)),
+        builder_.CreateSelect(anyInvalid, builder_.getInt32(0x20000000u),
+                              builder_.getInt32(0)));
+    Value *enabled = builder_.CreateICmpNE(
+        builder_.CreateAnd(
+            builder_.CreateAnd(builder_.CreateLShr(fpscr, 22), fpscr),
+            builder_.getInt32(0xF8u)),
+        builder_.getInt32(0));
+    fpscr = builder_.CreateOr(
+        builder_.CreateAnd(fpscr, builder_.getInt32(~0x40000000u)),
+        builder_.CreateSelect(enabled, builder_.getInt32(0x40000000u),
+                              builder_.getInt32(0)));
+    builder_.CreateStore(fpscr, state_[DOLIR_STATE_FPSCR]);
+    known_state_[DOLIR_STATE_FPSCR] = nullptr;
+    emitHostFPMode(fpscr_before_write_, fpscr);
+    fpscr_before_write_ = nullptr;
+    fp_denormal_safe_.fill(false);
+    return;
+  }
   syncState(DOLIR_STATE_FPSCR);
   auto callee = module_.getOrInsertFunction(
       "ppc_fpscr_control_updated",
@@ -140,6 +218,20 @@ void FunctionEmitter::emitFPSCRUpdated() {
 }
 
 void FunctionEmitter::emitFPSCRBit(u64 descriptor) {
+  const u32 bitMask = 0x80000000u >> (descriptor & 0x1Fu);
+  if (inline_fpscr_ && (bitMask & 7u)) {
+    // RN or NI: no exception bit and no summary bit changes.
+    Value *before = stateValue(DOLIR_STATE_FPSCR);
+    Value *after = ((descriptor >> 8) & 1u)
+                       ? builder_.CreateOr(before, builder_.getInt32(bitMask))
+                       : builder_.CreateAnd(before,
+                                            builder_.getInt32(~bitMask));
+    builder_.CreateStore(after, state_[DOLIR_STATE_FPSCR]);
+    known_state_[DOLIR_STATE_FPSCR] = nullptr;
+    emitHostFPMode(before, after);
+    fp_denormal_safe_.fill(false);
+    return;
+  }
   syncState(DOLIR_STATE_FPSCR);
   const char *name =
       ((descriptor >> 8) & 1u) ? "ppc_mtfsb1_op" : "ppc_mtfsb0_op";

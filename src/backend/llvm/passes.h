@@ -11,6 +11,9 @@ class raw_ostream;
 
 namespace dolllvm {
 
+// Generated functions have hundreds of blocks (every memory access has a cold
+// path); LLVM's default limits for load forwarding stop well short of that.
+void raiseOptimizerLimits();
 bool optimizeModule(llvm::Module &module, llvm::TargetMachine &machine,
                     const DolLLVMOptions &options,
                     llvm::raw_ostream &diagnostics);

@@ -36,13 +36,25 @@ void FunctionEmitter::scanStableControls() {
   }
 }
 
+// A register as it is on entry. With split entry loads the register copies
+// are filled in further down each entry path, so the value comes from the
+// context, where it is the same.
+Value *FunctionEmitter::entryValue(DolIRStateSlot slot, const char *name) {
+  if (split_entry_loads_ && !slotInMemory(slot)) {
+    Value *value = loadContext(slot);
+    value->setName(name);
+    return value;
+  }
+  return builder_.CreateLoad(type(dolir_state_type(slot)), state_[slot], name);
+}
+
 void FunctionEmitter::initializeEntryControls() {
   Type *i32 = Type::getInt32Ty(context_);
   for (u32 gqr = 0; gqr < 8; gqr++) {
     auto slot = static_cast<DolIRStateSlot>(DOLIR_STATE_GQR0 + gqr);
     if (!stable_gqr_[gqr] || !used_[slot])
       continue;
-    Value *value = builder_.CreateLoad(i32, state_[slot], "gqr.entry");
+    Value *value = entryValue(slot, "gqr.entry");
     entry_gqr_[gqr] = value;
     entry_gqr_load_type_[gqr] =
         builder_.CreateAnd(builder_.CreateLShr(value, builder_.getInt32(16)),
@@ -63,8 +75,7 @@ void FunctionEmitter::initializeEntryControls() {
         builder_.getInt32(26), "gqr.store.scale");
   }
   if (stable_hid2_ && used_[DOLIR_STATE_HID2]) {
-    Value *hid2 =
-        builder_.CreateLoad(i32, state_[DOLIR_STATE_HID2], "hid2.entry");
+    Value *hid2 = entryValue(DOLIR_STATE_HID2, "hid2.entry");
     entry_psq_indexed_enabled_ = builder_.CreateICmpNE(
         builder_.CreateAnd(hid2, builder_.getInt32(PPC_HID2_PSE)),
         builder_.getInt32(0), "psq.indexed.enabled");
@@ -74,8 +85,7 @@ void FunctionEmitter::initializeEntryControls() {
         builder_.getInt32(PPC_HID2_PSE | PPC_HID2_LSQE), "psq.direct.enabled");
   }
   if (stable_ni_ && used_[DOLIR_STATE_FPSCR]) {
-    Value *fpscr =
-        builder_.CreateLoad(i32, state_[DOLIR_STATE_FPSCR], "fpscr.control");
+    Value *fpscr = entryValue(DOLIR_STATE_FPSCR, "fpscr.control");
     entry_ni_enabled_ =
         builder_.CreateICmpNE(builder_.CreateAnd(fpscr, builder_.getInt32(4)),
                               builder_.getInt32(0), "fpscr.ni");

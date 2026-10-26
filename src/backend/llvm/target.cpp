@@ -1,4 +1,5 @@
 #include "backend/llvm/target.h"
+#include "backend/codegen_switches.h"
 
 #include <array>
 #include <cstring>

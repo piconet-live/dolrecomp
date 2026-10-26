@@ -99,6 +99,10 @@ bool FunctionEmitter::emitWrapper(raw_ostream &diagnostics) {
           builder_.CreateZExt(returnPC, Type::getInt64Ty(context_)),
           builder_.getInt64(32)));
   SmallVector<Value *, 32> arguments = {wrapper->getArg(0), chain, control};
+  if (register_counters_) {
+    arguments.push_back(builder_.getInt64(0));
+    arguments.push_back(builder_.getInt64(0));
+  }
   if (native_abi_) {
     if (nativeCyclesInResult(abi_range_))
       arguments.push_back(builder_.getInt64(0));
@@ -111,6 +115,14 @@ bool FunctionEmitter::emitWrapper(raw_ostream &diagnostics) {
   CallInst *body = builder_.CreateCall(function_, arguments);
   body->setCallingConv(bodyCallingConvention());
   body->addFnAttr(Attribute::NoInline);
+  if (register_counters_) {
+    // The cycles the body hands back have not been charged yet.
+    Value *downcount =
+        loadOffset(Type::getInt64Ty(context_), offsetof(CPUState, downcount));
+    builder_.CreateStore(
+        builder_.CreateSub(downcount, builder_.CreateExtractValue(body, 0)),
+        bytePtr(offsetof(CPUState, downcount)));
+  }
   if (native_abi_) {
     u32 field = cold_escapes_ ? 0u : 2u;
     for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {

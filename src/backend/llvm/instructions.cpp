@@ -1,8 +1,11 @@
 #include "backend/llvm/emitter.h"
 #include "backend/llvm/native_abi.h"
 
+#include <algorithm>
+
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/Format.h>
@@ -14,23 +17,38 @@ using namespace llvm;
 
 bool FunctionEmitter::emitRegion(u32 index, raw_ostream &diagnostics) {
   resetFPRepresentations();
+  applySingleSeed(index);
   known_state_.fill(nullptr);
   psq_direct_proven_ = false;
   psq_indexed_proven_ = false;
   fp_available_checked_ = false;
-  pending_fprf_ = nullptr;
+  clearPendingFPRF();
+  unsynced_.reset();
+  // What the runs that branch here have left unwritten (carryUnsynced).
+  if (!lazy_allowed_.empty())
+    unsynced_ = lazy_allowed_[index];
+  lazy_edge_.fill(nullptr);
+  deferred_cycles_ = 0;
+  fpscr_before_write_ = nullptr;
   builder_.SetInsertPoint(blocks_[index]);
+  GlobalVariable *runCount =
+      countHere(source_.blocks[index].guest_address, closed_ ? 1u : 0u, 0);
   for (u32 current = index; current < source_.block_count; current++) {
     const DolIRBlock &block = source_.blocks[current];
     if (current != index && region_leaders_[current]) {
+      setCountDetail(runCount, closed_ ? 1u : 0u, current - index);
       materializeFPRF();
+      if (!carryUnsynced(&current, 1))
+        storeUnsynced(true);
+      flushDeferredCycles();
+      recordSingleEdge();
       builder_.CreateBr(blocks_[current]);
       return true;
     }
     const bool useService =
         modern_runtime_ && native_abi_ && needsInterpreter(block);
     if (loop_headers_[current])
-      emitBudgetGuard(block.guest_address);
+      emitBudgetGuard(block.guest_address, true);
     chargeCycles(block.cycle_cost);
     if (useService) {
       emitInstructionService(block.guest_address);
@@ -47,7 +65,26 @@ bool FunctionEmitter::emitRegion(u32 index, raw_ostream &diagnostics) {
           next < source_.block_count && !region_leaders_[next])
         continue;
     }
+    setCountDetail(runCount, closed_ ? 1u : 0u, current - index + 1u);
     materializeFPRF();
+    {
+      const DolIRTerminator &term = block.terminator;
+      bool carried = false;
+      if (!term.linked && (term.kind == DOLIR_TERM_FALLTHROUGH ||
+                           term.kind == DOLIR_TERM_BRANCH))
+        carried = carryUnsynced(&term.targets[0], 1);
+      else if (!term.linked && term.kind == DOLIR_TERM_COND_BRANCH)
+        carried = carryUnsynced(term.targets, 2);
+      if (!carried)
+        storeUnsynced(true);
+    }
+    flushDeferredCycles();
+    // The closing branch of a plain terminator is created in this block
+    // (calls and exits get blocks of their own, which provide no facts).
+    if (block.terminator.kind == DOLIR_TERM_FALLTHROUGH ||
+        block.terminator.kind == DOLIR_TERM_BRANCH ||
+        block.terminator.kind == DOLIR_TERM_COND_BRANCH)
+      recordSingleEdge();
     return emitTerminator(block.terminator, diagnostics);
   }
   diagnostics << "dolllvm: unterminated native region at 0x"
@@ -106,6 +143,20 @@ bool FunctionEmitter::emitInstruction(const DolIRInstruction &inst,
     break;
   case DOLIR_OP_STATE_READ:
     result = stateValue(static_cast<DolIRStateSlot>(inst.aux));
+    if (inst.aux >= DOLIR_STATE_FPR0 && inst.aux <= DOLIR_STATE_FPR31 &&
+        ps0Single(inst.aux - DOLIR_STATE_FPR0))
+      noteSingleValue(result);
+    if (track_singles_ && inst.aux >= DOLIR_STATE_FPR0 &&
+        inst.aux <= DOLIR_STATE_PS1_31) {
+      const bool ps0 = inst.aux <= DOLIR_STATE_FPR31;
+      const u32 reg = inst.aux - (ps0 ? DOLIR_STATE_FPR0 : DOLIR_STATE_PS1_0);
+      if (ps0 ? laneView(reg)
+              : fp_rep_[reg] == FPRepresentation::PairF32 &&
+                    fp_exact_single_[reg])
+        noteTwin(result,
+                 builder_.CreateExtractElement(pairF32(reg), ps0 ? 0u : 1u),
+                 fp_denormal_safe_[reg], fp_single_canonical_[reg]);
+    }
     break;
   case DOLIR_OP_STATE_WRITE:
     emitStateWrite(inst);
@@ -170,6 +221,13 @@ bool FunctionEmitter::emitInstruction(const DolIRInstruction &inst,
   case DOLIR_OP_FPTRUNC:
   case DOLIR_OP_FPEXT:
     result = castValue(inst.op, resultType, operand(inst, 0));
+    if (inst.op == DOLIR_OP_FPEXT && operand(inst, 0)->getType()->isFloatTy()) {
+      noteSingleValue(result);
+      // An lfs load: widened under the host mode that single arithmetic on
+      // it will run under; its bits are the loaded ones (not canonical).
+      if (track_singles_)
+        noteTwin(result, operand(inst, 0), true, false);
+    }
     break;
   case DOLIR_OP_ICMP_EQ:
     result = builder_.CreateICmpEQ(operand(inst, 0), operand(inst, 1));
@@ -201,6 +259,16 @@ bool FunctionEmitter::emitInstruction(const DolIRInstruction &inst,
   case DOLIR_OP_SELECT:
     result = builder_.CreateSelect(operand(inst, 0), operand(inst, 1),
                                    operand(inst, 2));
+    if (track_singles_) {
+      const SingleTwin *left = twinOf(operand(inst, 1));
+      const SingleTwin *right = twinOf(operand(inst, 2));
+      if (left && right)
+        noteTwin(result,
+                 builder_.CreateSelect(operand(inst, 0), left->single,
+                                       right->single),
+                 left->safe && right->safe,
+                 left->canonical && right->canonical);
+    }
     break;
   case DOLIR_OP_FADD:
     result = builder_.CreateFAdd(operand(inst, 0), operand(inst, 1));
@@ -216,11 +284,26 @@ bool FunctionEmitter::emitInstruction(const DolIRInstruction &inst,
     break;
   case DOLIR_OP_FNEG:
     result = builder_.CreateFNeg(operand(inst, 0));
+    if (std::find(single_values_.begin(), single_values_.end(),
+                  operand(inst, 0)) != single_values_.end())
+      noteSingleValue(result);
+    if (const SingleTwin *twin = twinOf(operand(inst, 0)))
+      noteTwin(result, builder_.CreateFNeg(twin->single), twin->safe,
+               twin->canonical);
     break;
   case DOLIR_OP_FABS: {
     Function *intrinsic =
         Intrinsic::getDeclaration(&module_, Intrinsic::fabs, {resultType});
     result = builder_.CreateCall(intrinsic, {operand(inst, 0)});
+    if (std::find(single_values_.begin(), single_values_.end(),
+                  operand(inst, 0)) != single_values_.end())
+      noteSingleValue(result);
+    if (const SingleTwin *twin = twinOf(operand(inst, 0))) {
+      Function *single = Intrinsic::getDeclaration(
+          &module_, Intrinsic::fabs, {twin->single->getType()});
+      noteTwin(result, builder_.CreateCall(single, {twin->single}), twin->safe,
+               twin->canonical);
+    }
     break;
   }
   case DOLIR_OP_VECTOR_BUILD: {

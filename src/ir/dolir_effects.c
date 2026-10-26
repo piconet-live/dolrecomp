@@ -1,5 +1,7 @@
 #include "ir/dolir.h"
 
+#include "backend/codegen_switches.h"
+
 #include <string.h>
 
 static void mark(u64* mask, DolIRStateSlot slot) {
@@ -8,6 +10,19 @@ static void mark(u64* mask, DolIRStateSlot slot) {
 
 bool dolir_state_mask_test(const u64* mask, DolIRStateSlot slot) {
     return (mask[(u32)slot / 64u] & (1ull << ((u32)slot & 63u))) != 0;
+}
+
+/* DOLRECOMP_RESERVATION=stwcx-only: an ordinary store leaves the lwarx
+   reservation alone, as in Dolphin (only stwcx. and exceptions end it). The
+   default clears the reservation when a store hits the reserved cache line,
+   which costs every store a compare and makes the two reservation slots live
+   state of every function that stores. */
+static bool stores_clear_reservation(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = !dolrecomp_codegen_switch_is("DOLRECOMP_RESERVATION",
+                                              "stwcx-only");
+    return cached != 0;
 }
 
 static void use_pair(DolIRInstruction* instruction, u32 reg) {
@@ -139,7 +154,7 @@ static void helper_effects(DolIRInstruction* instruction) {
         use_pair(instruction, reg);
         if (instruction->aux == DOLIR_HELPER_PSQ_LOAD)
             define_pair(instruction, reg);
-        else {
+        else if (stores_clear_reservation()) {
             mark(instruction->state_uses, DOLIR_STATE_RESERVE_ADDR);
             mark(instruction->state_uses, DOLIR_STATE_RESERVE_VALID);
             mark(instruction->state_defs, DOLIR_STATE_RESERVE_VALID);
@@ -182,7 +197,7 @@ void dolir_populate_effects(DolIRInstruction* instruction) {
         mark(instruction->state_defs, (DolIRStateSlot)instruction->aux);
     else if (instruction->op == DOLIR_OP_HELPER_CALL)
         helper_effects(instruction);
-    if (instruction->op == DOLIR_OP_GUEST_STORE) {
+    if (instruction->op == DOLIR_OP_GUEST_STORE && stores_clear_reservation()) {
         mark(instruction->state_uses, DOLIR_STATE_RESERVE_ADDR);
         mark(instruction->state_uses, DOLIR_STATE_RESERVE_VALID);
         mark(instruction->state_defs, DOLIR_STATE_RESERVE_VALID);

@@ -137,21 +137,26 @@ Value *FunctionEmitter::loadContext(DolIRStateSlot slot) {
     }
   }
   if (slot >= DOLIR_STATE_CR0 && slot <= DOLIR_STATE_CR7) {
-    Value *packed = builder_.CreateLoad(Type::getInt32Ty(context_),
-                                        bytePtr(offsetof(CPUState, cr)));
+    Value *packed = tagRegisterLoad(
+        builder_.CreateLoad(Type::getInt32Ty(context_),
+                            bytePtr(offsetof(CPUState, cr))),
+        slot);
     const u32 shift = 28u - 4u * (slot - DOLIR_STATE_CR0);
     return builder_.CreateAnd(builder_.CreateLShr(packed, shift),
                               builder_.getInt32(0xFu));
   }
   if (slot >= DOLIR_STATE_XER_CA && slot <= DOLIR_STATE_XER_SO) {
-    Value *packed = builder_.CreateLoad(Type::getInt32Ty(context_),
-                                        bytePtr(offsetof(CPUState, xer)));
+    Value *packed = tagRegisterLoad(
+        builder_.CreateLoad(Type::getInt32Ty(context_),
+                            bytePtr(offsetof(CPUState, xer))),
+        slot);
     const u32 shift = 29u + (slot - DOLIR_STATE_XER_CA);
     return builder_.CreateTrunc(builder_.CreateLShr(packed, shift),
                                 Type::getInt1Ty(context_));
   }
-  return builder_.CreateLoad(type(dolir_state_type(slot)),
-                             bytePtr(stateOffset(slot)));
+  return tagRegisterLoad(builder_.CreateLoad(type(dolir_state_type(slot)),
+                                             bytePtr(stateOffset(slot))),
+                         slot);
 }
 
 } // namespace dolllvm

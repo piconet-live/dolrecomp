@@ -24,6 +24,7 @@ Value *FunctionEmitter::emitPSQLoad(const DolIRInstruction &inst,
   auto incomingRepresentations = fp_rep_;
   auto incomingExactSingles = fp_exact_single_;
   auto incomingDenormalSafety = fp_denormal_safe_;
+  auto incomingTrackViews = fp_track_view_;
   auto incomingValueClasses = fp_value_class_;
   auto incomingKnownState = known_state_;
   bool incomingFPAvailable = fp_available_checked_;
@@ -125,10 +126,12 @@ Value *FunctionEmitter::emitPSQLoad(const DolIRInstruction &inst,
              Type::getInt1Ty(context_), Type::getInt32Ty(context_)},
             false));
     materialize(inst.guest_pc);
-    success = builder_.CreateCall(
+    CallInst *helper = builder_.CreateCall(
         callee, {ctx_, builder_.getInt8(reg), address, builder_.getInt1(w),
                  builder_.getInt8(gqr), builder_.getInt1(indexed),
                  builder_.getInt32(inst.guest_pc)});
+    tagRuntimeCall(helper, RegisterWrites::FloatingPoint);
+    success = helper;
     resume = BasicBlock::Create(context_, "psq_load_resume", function_);
     BasicBlock *failed =
         BasicBlock::Create(context_, "psq_load_exit", function_);
@@ -136,7 +139,14 @@ Value *FunctionEmitter::emitPSQLoad(const DolIRInstruction &inst,
     builder_.SetInsertPoint(failed);
     returnFromBody();
     builder_.SetInsertPoint(resume);
-    reloadUsedState();
+    if (sync_changed_) {
+      // The load helper changes the loaded register and nothing else.
+      reloadState(static_cast<DolIRStateSlot>(DOLIR_STATE_FPR0 + reg));
+      reloadState(static_cast<DolIRStateSlot>(DOLIR_STATE_PS1_0 + reg));
+      fp_rep_[reg] = FPRepresentation::Raw;
+    } else {
+      reloadUsedState();
+    }
     builder_.CreateStore(roundPairToSingle(pairF64(reg)), pair_f32_[reg]);
     builder_.CreateBr(join);
   }
@@ -154,11 +164,18 @@ Value *FunctionEmitter::emitPSQLoad(const DolIRInstruction &inst,
   fp_rep_ = incomingRepresentations;
   fp_exact_single_ = incomingExactSingles;
   fp_denormal_safe_ = incomingDenormalSafety;
+  fp_track_view_ = incomingTrackViews;
   fp_value_class_ = incomingValueClasses;
   known_state_ = incomingKnownState;
   fp_available_checked_ = incomingFPAvailable;
+  markWritten(static_cast<DolIRStateSlot>(DOLIR_STATE_FPR0 + reg));
+  markWritten(static_cast<DolIRStateSlot>(DOLIR_STATE_PS1_0 + reg));
   fp_rep_[reg] = FPRepresentation::PairF32;
   fp_exact_single_[reg] = true;
+  fp_track_view_[reg] = false;
+  fp_single_canonical_[reg] = false;
+  fp_ps0_float_[reg] = nullptr;
+  fp_ps1_float_[reg] = nullptr;
   fp_denormal_safe_[reg] = false;
   fp_value_class_[reg] = FPValueClass::Unknown;
   psq_indexed_proven_ = true;

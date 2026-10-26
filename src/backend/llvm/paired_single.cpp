@@ -233,6 +233,7 @@ void FunctionEmitter::emitExactPaired(u64 descriptor) {
   reloadState(DOLIR_STATE_FPSCR);
   fp_rep_[d] = FPRepresentation::Raw;
   fp_exact_single_[d] = false;
+  fp_ps0_single_[d] = false;
   fp_denormal_safe_[d] = false;
   if (op != DOLIR_EXACT_PS_RES && op != DOLIR_EXACT_PS_RSQRTE) {
     Value *result = pairF64(d);
@@ -241,6 +242,7 @@ void FunctionEmitter::emitExactPaired(u64 descriptor) {
     builder_.CreateStore(single, pair_f32_[d]);
     fp_rep_[d] = FPRepresentation::PairF32;
     fp_exact_single_[d] = true;
+    fp_track_view_[d] = false;
     fp_denormal_safe_[d] = true;
   } else {
     fp_rep_[d] = FPRepresentation::Raw;
